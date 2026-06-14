@@ -21,7 +21,13 @@ Port of the Crystal reference (`c0-cr`):
 - JSON: the `Value` tree and `to_value`/`from_value` (dependency-free), with
   `to_json`/`from_json` text helpers behind the optional `json` feature
 
-It passes the shared language-agnostic conformance vectors in `conformance/`.
+It passes the shared language-agnostic conformance vectors from
+[c0-spec](https://github.com/trans/c0-spec), included here as a git submodule
+at `c0-spec/`. After cloning:
+
+```sh
+git submodule update --init
+```
 
 Not yet ported: a YAML converter and a serde-style derive (the `Serializable`
 equivalent).

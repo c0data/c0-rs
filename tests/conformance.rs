@@ -9,7 +9,8 @@ use std::path::PathBuf;
 
 fn cases(file: &str) -> Vec<Value> {
     let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    p.push("conformance");
+    p.push("c0-spec");
+    p.push("vectors");
     p.push(file);
     let text = fs::read_to_string(&p).unwrap_or_else(|e| panic!("read {p:?}: {e}"));
     let v: Value = serde_json::from_str(&text).unwrap();
