@@ -1,0 +1,16 @@
+[package]
+name = "c0"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+authors = ["Thomas Sawyer <transfire@gmail.com>"]
+license = "MIT"
+description = "C0DATA — structured data using ASCII C0 control codes"
+keywords = ["c0", "c0data", "data-format", "control-codes", "serialization"]
+categories = ["encoding", "parser-implementations"]
+repository = "https://github.com/trans/c0-rs"
+
+[dependencies]
+
+[dev-dependencies]
+serde_json = "1"
