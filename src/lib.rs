@@ -28,6 +28,7 @@ mod tokenizer;
 
 pub mod csv;
 pub mod diff;
+pub mod json;
 
 pub use builder::Builder;
 pub use document::{Document, Group};

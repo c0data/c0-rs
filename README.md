@@ -18,11 +18,25 @@ Port of the Crystal reference (`c0-cr`):
 - pretty form: compact, aligned, and spaced layouts + round-tripping parse
 - CSV ⇄ C0DATA conversion
 - C0DIFF: parse, build, and atomic multi-file apply
+- JSON: the `Value` tree and `to_value`/`from_value` (dependency-free), with
+  `to_json`/`from_json` text helpers behind the optional `json` feature
 
 It passes the shared language-agnostic conformance vectors in `conformance/`.
 
-Not yet ported: the JSON/YAML converters and a serde-style derive (the
-`Serializable` equivalent).
+Not yet ported: a YAML converter and a serde-style derive (the `Serializable`
+equivalent).
+
+## Features
+
+The library is dependency-free by default. The optional `json` feature adds
+JSON *text* conversion and pulls in `serde_json`:
+
+```toml
+c0 = { version = "0.1", features = ["json"] }
+```
+
+`json::to_value`/`from_value` (C0DATA ⇄ an in-memory tree) need no feature and
+no dependency; only the JSON-text helpers do.
 
 ## Usage
 
