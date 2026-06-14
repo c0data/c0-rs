@@ -26,9 +26,12 @@ mod table;
 mod token;
 mod tokenizer;
 
+pub mod csv;
+pub mod diff;
+
 pub use builder::Builder;
 pub use document::{Document, Group};
-pub use pretty::{format, format_with, glyph, parse};
+pub use pretty::{align, format, format_mode, format_with, glyph, parse, FormatMode};
 pub use stream::{open_log, read_log, FileLog, StreamReader, StreamWriter};
 pub use table::{Record, Table};
 pub use token::{Token, TokenType};

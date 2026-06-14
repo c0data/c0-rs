@@ -11,13 +11,18 @@ and return slices (`&[u8]`) into it, decoding escapes only on demand
 
 ## Status
 
-Core port of the Crystal reference (`c0-cr`): tokenizer, table/record and
-document/group navigation, builder, canonical-form helpers, ETB stream mode,
-and pretty (compact layout) formatting + parsing. It passes the shared
-language-agnostic conformance vectors in `conformance/`.
+Port of the Crystal reference (`c0-cr`):
 
-Not yet ported: the CSV/JSON converters, the C0DIFF engine, a serde-style
-derive, and pretty's column-alignment modes.
+- tokenizer, table/record and document/group navigation, builder
+- canonical-form helpers, ETB stream mode
+- pretty form: compact, aligned, and spaced layouts + round-tripping parse
+- CSV ⇄ C0DATA conversion
+- C0DIFF: parse, build, and atomic multi-file apply
+
+It passes the shared language-agnostic conformance vectors in `conformance/`.
+
+Not yet ported: the JSON/YAML converters and a serde-style derive (the
+`Serializable` equivalent).
 
 ## Usage
 
