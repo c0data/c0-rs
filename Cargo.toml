@@ -8,7 +8,7 @@ license = "MIT"
 description = "C0DATA — structured data using ASCII C0 control codes"
 keywords = ["c0", "c0data", "data-format", "control-codes", "serialization"]
 categories = ["encoding", "parser-implementations"]
-repository = "https://github.com/trans/c0-rs"
+repository = "https://github.com/c0data/c0-rs"
 
 [features]
 default = []

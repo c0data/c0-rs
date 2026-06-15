@@ -1,6 +1,6 @@
 # c0
 
-A Rust implementation of [C0DATA](https://github.com/trans/c0data) — structured
+A Rust implementation of [C0DATA](https://github.com/c0data/c0-cr) — structured
 data built on ASCII C0 control codes. Values are plain UTF-8 text; structure is
 expressed through single-byte control codes (FS/GS/RS/US separators, SOH
 headers, STX/ETX nesting, DLE escape, ETB stream commits).
@@ -22,7 +22,7 @@ Port of the Crystal reference (`c0-cr`):
   `to_json`/`from_json` text helpers behind the optional `json` feature
 
 It passes the shared language-agnostic conformance vectors from
-[c0-spec](https://github.com/trans/c0-spec), included here as a git submodule
+[c0-spec](https://github.com/c0data/c0-spec), included here as a git submodule
 at `c0-spec/`. After cloning:
 
 ```sh
