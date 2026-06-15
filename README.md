@@ -1,6 +1,6 @@
 # c0
 
-A Rust implementation of [C0DATA](https://github.com/c0data/c0-cr) — structured
+A Rust implementation of [C0DATA](https://github.com/c0data) — structured
 data built on ASCII C0 control codes. Values are plain UTF-8 text; structure is
 expressed through single-byte control codes (FS/GS/RS/US separators, SOH
 headers, STX/ETX nesting, DLE escape, ETB stream commits).
