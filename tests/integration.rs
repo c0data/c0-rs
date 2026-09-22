@@ -168,3 +168,88 @@ fn names_reject_control_bytes() {
     });
     assert!(r.is_err(), "control byte in a name must panic");
 }
+
+#[test]
+fn list_field_roundtrip() {
+    let buf = c0::Builder::build(|b| {
+        b.group("users", None);
+        b.record(&["Alice"]);
+        b.list_field(&["Admin", "Editor", "User"]);
+        b.field("1502.30");
+    });
+    let expected: Vec<u8> = [
+        &[c0::GS][..],
+        b"users",
+        &[c0::RS],
+        b"Alice",
+        &[c0::US, c0::STX],
+        b"Admin",
+        &[c0::US],
+        b"Editor",
+        &[c0::US],
+        b"User",
+        &[c0::ETX],
+        &[c0::US],
+        b"1502.30",
+    ]
+    .concat();
+    assert_eq!(buf, expected);
+
+    let t = c0::Table::new(&buf);
+    let rec = t.record(0);
+    assert_eq!(rec.field_count(), 3);
+    assert_eq!(&*rec.value(0), b"Alice");
+    let list = rec.list(1);
+    let items: Vec<&[u8]> = list.iter().map(|c| &**c).collect();
+    assert_eq!(items, vec![&b"Admin"[..], b"Editor", b"User"]);
+    assert_eq!(&*rec.value(2), b"1502.30");
+}
+
+#[test]
+fn list_field_escaped_items_and_empty() {
+    let items = ["a\u{1f}b", "", "c\u{02}d", "plain"];
+    let buf = c0::Builder::build(|b| {
+        b.group("t", None);
+        b.record(&["x"]);
+        b.list_field(&items);
+        b.list_field(&[]);
+    });
+    let t = c0::Table::new(&buf);
+    let rec = t.record(0);
+    assert_eq!(rec.field_count(), 3);
+    let got: Vec<Vec<u8>> = rec.list(1).iter().map(|c| c.to_vec()).collect();
+    let want: Vec<Vec<u8>> = items.iter().map(|s| s.as_bytes().to_vec()).collect();
+    assert_eq!(got, want);
+    assert!(rec.list(2).is_empty());
+}
+
+#[test]
+fn record_list_keeps_nested_scopes_and_plain_fields() {
+    let buf: Vec<u8> = [
+        &[c0::GS][..],
+        b"t",
+        &[c0::RS, c0::STX],
+        b"a",
+        &[c0::US, c0::STX],
+        b"x",
+        &[c0::US],
+        b"y",
+        &[c0::ETX, c0::US],
+        b"b",
+        &[c0::ETX],
+        &[c0::US],
+        b"plain",
+        &[c0::US, c0::STX, c0::ETX],
+    ]
+    .concat();
+    let t = c0::Table::new(&buf);
+    let rec = t.record(0);
+    let items = rec.list(0);
+    assert_eq!(items.len(), 3);
+    assert_eq!(&*items[0], b"a");
+    assert_eq!(items[1][0], c0::STX);
+    assert_eq!(&*items[2], b"b");
+    assert_eq!(rec.list(1).len(), 1);
+    assert_eq!(&*rec.list(1)[0], b"plain");
+    assert!(rec.list(2).is_empty());
+}

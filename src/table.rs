@@ -247,6 +247,44 @@ impl<'a> Record<'a> {
         (0..self.field_count()).map(|i| self.value(i)).collect()
     }
 
+    /// Field `n` as a flat list: the items of its STX/ETX scope split on
+    /// top-level US, each DLE-unescaped (mirrors [`value`](Self::value)).
+    /// Inverse of [`Builder::list_field`](crate::Builder::list_field). A
+    /// field that is not an STX/ETX scope is returned as a single-item list
+    /// holding its value; an empty scope is an empty list.
+    pub fn list(&self, n: usize) -> Vec<Cow<'a, [u8]>> {
+        let raw = self.field(n);
+        if raw.first() != Some(&STX) {
+            return vec![unescape(raw)];
+        }
+        let mut stop = raw.len();
+        if stop > 1 && raw[stop - 1] == ETX {
+            stop -= 1;
+        }
+        let mut items = Vec::new();
+        if stop <= 1 {
+            return items;
+        }
+        let mut pos = 1;
+        let mut item_start = pos;
+        while pos < stop {
+            let byte = raw[pos];
+            if byte == US {
+                items.push(unescape(&raw[item_start..pos]));
+                pos += 1;
+                item_start = pos;
+            } else if byte == DLE {
+                pos += 2;
+            } else if byte == STX {
+                pos = skip_nested(raw, pos, stop);
+            } else {
+                pos += 1;
+            }
+        }
+        items.push(unescape(&raw[item_start..stop]));
+        items
+    }
+
     /// Raw bytes of the entire record.
     #[inline]
     pub fn raw(&self) -> &'a [u8] {

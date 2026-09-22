@@ -119,6 +119,22 @@ impl Builder {
         self
     }
 
+    /// Write a field whose value is a flat list (spec: "arrays are
+    /// US-separated values inside STX/ETX"): US, STX, the items separated by
+    /// US, ETX. Read back with [`Record::list`](crate::Record::list).
+    pub fn list_field(&mut self, items: &[&str]) -> &mut Self {
+        self.buf.push(US);
+        self.buf.push(STX);
+        for (i, item) in items.iter().enumerate() {
+            if i > 0 {
+                self.buf.push(US);
+            }
+            self.write_escaped(item);
+        }
+        self.buf.push(ETX);
+        self
+    }
+
     /// Write a single US-prefixed field value (escaped).
     pub fn field(&mut self, value: &str) -> &mut Self {
         self.buf.push(US);
