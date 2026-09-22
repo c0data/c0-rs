@@ -199,3 +199,55 @@ fn stream() {
         }
     }
 }
+
+#[test]
+fn list() {
+    for c in cases("list.json") {
+        let case = c["name"].as_str().unwrap();
+        let bytes = hex_bytes(c["bytes"].as_str().unwrap());
+        let record = c["record"].as_array().unwrap();
+
+        let rec = Table::new(&bytes).record(0);
+        assert_eq!(rec.field_count(), record.len(), "{case}: arity");
+        for (i, f) in record.iter().enumerate() {
+            match f.as_array() {
+                Some(items) => {
+                    let got: Vec<Vec<u8>> = rec.list(i).iter().map(|v| v.to_vec()).collect();
+                    let want: Vec<Vec<u8>> = items.iter().map(field_bytes).collect();
+                    assert_eq!(got, want, "{case}: field {i} list");
+                }
+                None => assert_eq!(
+                    rec.value(i).as_ref(),
+                    field_bytes(f).as_slice(),
+                    "{case}: field {i} value"
+                ),
+            }
+        }
+
+        if !c["canonical"].as_bool().unwrap() {
+            continue;
+        }
+        assert!(canonical(&bytes), "{case}: bytes must be canonical");
+
+        // The builder takes &str; a case whose values are not UTF-8 (e.g.
+        // a binary list item) is verified above as canonical bytes but
+        // cannot be rebuilt through the &str API.
+        let first = field_bytes(&record[0]);
+        let buf = Builder::build(|b| {
+            b.record(&[first.as_slice()]);
+            for f in &record[1..] {
+                match f.as_array() {
+                    Some(items) => {
+                        let owned: Vec<Vec<u8>> = items.iter().map(field_bytes).collect();
+                        b.list_field(&owned);
+                    }
+                    None => {
+                        b.field(field_bytes(f));
+                    }
+                }
+            }
+        });
+        assert_eq!(to_hex(&buf), c["bytes"].as_str().unwrap(), "{case}: build");
+        assert!(canonical(&buf), "{case}: builder output must be canonical");
+    }
+}

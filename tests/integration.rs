@@ -212,7 +212,7 @@ fn list_field_escaped_items_and_empty() {
         b.group("t", None);
         b.record(&["x"]);
         b.list_field(&items);
-        b.list_field(&[]);
+        b.list_field::<&str>(&[]);
     });
     let t = c0::Table::new(&buf);
     let rec = t.record(0);

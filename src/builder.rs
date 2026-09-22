@@ -14,7 +14,9 @@ use crate::*;
 ///
 /// Names (file/group labels and SOH header fields) are identifiers: passing a
 /// control byte (`< 0x20`) in a name panics, matching the spec's "Canonical
-/// Form" rule. Record/field values are escaped automatically.
+/// Form" rule. Record/field values accept any `AsRef<[u8]>` (`&str`, `&[u8]`,
+/// `String`, `Vec<u8>`) and are byte-transparent: control bytes are escaped
+/// automatically.
 #[derive(Default)]
 pub struct Builder {
     buf: Vec<u8>,
@@ -69,13 +71,13 @@ impl Builder {
     }
 
     /// Write a record with positional fields.
-    pub fn record(&mut self, fields: &[&str]) -> &mut Self {
+    pub fn record<T: AsRef<[u8]>>(&mut self, fields: &[T]) -> &mut Self {
         self.buf.push(RS);
         for (i, field) in fields.iter().enumerate() {
             if i > 0 {
                 self.buf.push(US);
             }
-            self.write_escaped(field);
+            self.write_escaped(field.as_ref());
         }
         self
     }
@@ -95,9 +97,9 @@ impl Builder {
     /// Write an ETB commit marker followed by an integrity payload. The
     /// payload may not contain control bytes (it is terminated by the next
     /// control code on read); a control byte panics.
-    pub fn etb_payload(&mut self, payload: &str) -> &mut Self {
+    pub fn etb_payload(&mut self, payload: impl AsRef<[u8]>) -> &mut Self {
         self.buf.push(ETB);
-        for &byte in payload.as_bytes() {
+        for &byte in payload.as_ref() {
             assert!(byte >= 0x20, "ETB payload may not contain control bytes");
             self.buf.push(byte);
         }
@@ -122,23 +124,23 @@ impl Builder {
     /// Write a field whose value is a flat list (spec: "arrays are
     /// US-separated values inside STX/ETX"): US, STX, the items separated by
     /// US, ETX. Read back with [`Record::list`](crate::Record::list).
-    pub fn list_field(&mut self, items: &[&str]) -> &mut Self {
+    pub fn list_field<T: AsRef<[u8]>>(&mut self, items: &[T]) -> &mut Self {
         self.buf.push(US);
         self.buf.push(STX);
         for (i, item) in items.iter().enumerate() {
             if i > 0 {
                 self.buf.push(US);
             }
-            self.write_escaped(item);
+            self.write_escaped(item.as_ref());
         }
         self.buf.push(ETX);
         self
     }
 
     /// Write a single US-prefixed field value (escaped).
-    pub fn field(&mut self, value: &str) -> &mut Self {
+    pub fn field(&mut self, value: impl AsRef<[u8]>) -> &mut Self {
         self.buf.push(US);
-        self.write_escaped(value);
+        self.write_escaped(value.as_ref());
         self
     }
 
@@ -152,16 +154,16 @@ impl Builder {
     }
 
     /// Write a content block (RS + escaped text) for document mode.
-    pub fn block(&mut self, text: &str) -> &mut Self {
+    pub fn block(&mut self, text: impl AsRef<[u8]>) -> &mut Self {
         self.buf.push(RS);
-        self.write_escaped(text);
+        self.write_escaped(text.as_ref());
         self
     }
 
     /// Write a list item (US + escaped text) for document mode.
-    pub fn item(&mut self, text: &str) -> &mut Self {
+    pub fn item(&mut self, text: impl AsRef<[u8]>) -> &mut Self {
         self.buf.push(US);
-        self.write_escaped(text);
+        self.write_escaped(text.as_ref());
         self
     }
 
@@ -178,8 +180,8 @@ impl Builder {
     }
 
     // Writes a value, DLE-escaping any control bytes.
-    fn write_escaped(&mut self, s: &str) {
-        for &byte in s.as_bytes() {
+    fn write_escaped(&mut self, s: &[u8]) {
+        for &byte in s {
             if byte < 0x20 {
                 self.buf.push(DLE);
             }
