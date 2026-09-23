@@ -38,7 +38,7 @@ The library is dependency-free by default. The optional `json` feature adds
 JSON *text* conversion and pulls in `serde_json`:
 
 ```toml
-c0 = { version = "0.1", features = ["json"] }
+c0 = { version = "0.2", features = ["json"] }
 ```
 
 `json::to_value`/`from_value` (C0DATA ⇄ an in-memory tree) need no feature and
@@ -62,6 +62,26 @@ assert_eq!(t.record(0).field(0), b"Alice");
 
 // Compact form is canonical — hashable for content addressing
 assert!(canonical(&buf));
+```
+
+Value writers (`record`, `field`, `list_field`, `block`, `item`) take any
+`AsRef<[u8]>`, so `&str` and `&[u8]` both work and raw bytes round-trip.
+
+### List fields
+
+A field whose value is a flat list is written as US-separated items inside
+STX/ETX (`␂Admin␟Editor␃`). `list_field` writes one; `Record::list` reads it
+back as unescaped items.
+
+```rust
+let buf = c0::Builder::build(|b| {
+    b.group("users", None);
+    b.record(&["Alice"]);
+    b.list_field(&["Admin", "Editor"]);   // one field: ␂Admin␟Editor␃
+});
+let t = c0::Table::new(&buf);
+let roles = t.record(0).list(1);          // Vec<Cow<[u8]>>: [b"Admin", b"Editor"]
+assert_eq!(&*roles[0], b"Admin");
 ```
 
 ### Stream logs (ETB commits)
