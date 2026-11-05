@@ -1,118 +1,261 @@
-//! Stream mode: ETB commits for append-only logs.
+//! Stream mode: ETB-committed append logs (DESIGN.md "Stream Mode").
 //!
-//! C0DATA records are start-delimited, so a crashed append leaves a truncated
-//! final record indistinguishable from a complete one. In stream mode every
-//! appended block (one or more records, or an SOH header) is terminated by an
-//! ETB commit marker. A block is complete iff terminated by ETB.
+//! An unescaped ETB is always a commit, inside open text or a level too:
+//! such a block is damaged and yields nothing. The tail after the last
+//! commit is torn unless it holds only layout, notes or EOT.
+//!
+//! ```no_run
+//! let mut log = c0::open_log("events.c0")?;        // repairs a torn tail first
+//! log.start(&[("shape", "stream")])?;
+//! log.record(&["create", "a1b2", "1718208000"])?;
+//! let bytes = c0::read_log("events.c0")?;
+//! let r = c0::StreamReader::new(&bytes);
+//! assert!(!r.torn());
+//! # Ok::<(), std::io::Error>(())
+//! ```
 
 use crate::*;
+use std::borrow::Cow;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::Path;
 
-/// Scans a buffer for ETB commit markers and exposes only the committed
-/// region. Zero-copy: accessors return slices into the original buffer.
+/// Scans a buffer for commits and exposes the committed region, block by
+/// block. Zero-copy: accessors return slices into the original buffer.
 pub struct StreamReader<'a> {
     buf: &'a [u8],
-    commits: Vec<(usize, usize)>, // (etb offset, end of payload)
+    committed_end: usize,
+    blocks: Vec<(usize, usize)>,
+    damaged: Vec<usize>,
+    torn: bool,
 }
 
 impl<'a> StreamReader<'a> {
     pub fn new(buf: &'a [u8]) -> Self {
         let mut r = StreamReader {
             buf,
-            commits: Vec::new(),
+            committed_end: 0,
+            blocks: Vec::new(),
+            damaged: Vec::new(),
+            torn: false,
         };
         r.scan();
         r
     }
 
-    /// Offset just past the last commit marker and its payload.
+    pub fn buf(&self) -> &'a [u8] {
+        self.buf
+    }
+
+    /// Offset just past the last ETB and its payload.
     pub fn committed_end(&self) -> usize {
-        self.commits.last().map_or(0, |&(_, e)| e)
+        self.committed_end
     }
 
     /// The committed region of the buffer.
     pub fn committed(&self) -> &'a [u8] {
-        let end = self.committed_end();
-        &self.buf[..end]
+        &self.buf[..self.committed_end]
     }
 
-    /// Uncommitted trailing bytes — residue of an interrupted append.
+    /// Everything after the last commit.
     pub fn tail(&self) -> &'a [u8] {
-        let end = self.committed_end();
-        &self.buf[end..]
+        &self.buf[self.committed_end..]
     }
 
-    /// True if uncommitted bytes trail the last commit marker.
+    /// Whether data trails the last commit (layout, notes and EOT alone do
+    /// not count).
     pub fn torn(&self) -> bool {
-        self.committed_end() < self.buf.len()
+        self.torn
     }
 
-    /// Number of committed blocks.
     pub fn block_count(&self) -> usize {
-        self.commits.len()
+        self.blocks.len()
     }
 
-    /// Committed block by index: the bytes between the previous commit and
-    /// this block's ETB (marker and payload excluded).
+    /// Committed block `i`: the bytes from the previous commit to this
+    /// block's ETB (marker and payload excluded).
     pub fn block(&self, i: usize) -> &'a [u8] {
-        let start = if i == 0 { 0 } else { self.commits[i - 1].1 };
-        &self.buf[start..self.commits[i].0]
+        let (s, e) = self.blocks[i];
+        &self.buf[s..e]
     }
 
-    /// Iterate committed blocks.
+    /// `[start, end)` of every committed block.
+    pub fn block_ranges(&self) -> &[(usize, usize)] {
+        &self.blocks
+    }
+
     pub fn blocks(&self) -> impl Iterator<Item = &'a [u8]> + '_ {
-        (0..self.block_count()).map(move |i| self.block(i))
+        (0..self.blocks.len()).map(move |i| self.block(i))
     }
 
-    /// The committed region as a [`Table`].
-    pub fn table(&self) -> Table<'a> {
-        Table::new(self.committed())
+    /// Indexes of blocks cut by an ETB inside open text or a level.
+    pub fn damaged(&self) -> &[usize] {
+        &self.damaged
     }
 
-    // Find every ETB at structural level: DLE-escaped bytes are data, and an
-    // ETB inside an STX/ETX scope is record content, not a commit.
+    pub fn is_damaged(&self, i: usize) -> bool {
+        self.damaged.contains(&i)
+    }
+
+    /// The committed region with damaged blocks removed: borrowed when no
+    /// block is damaged, otherwise the undamaged blocks concatenated.
+    /// Read it with [`Document::new`] or [`Body::new`].
+    pub fn undamaged(&self) -> Cow<'a, [u8]> {
+        if self.damaged.is_empty() {
+            return Cow::Borrowed(self.committed());
+        }
+        let mut out = Vec::new();
+        for (i, &(s, e)) in self.blocks.iter().enumerate() {
+            if !self.damaged.contains(&i) {
+                out.extend_from_slice(&self.buf[s..e]);
+            }
+        }
+        Cow::Owned(out)
+    }
+
+    /// Logical values of every committed record (headings and header rows
+    /// excluded), undamaged blocks only.
+    pub fn records(&self) -> Result<Vec<Vec<Vec<u8>>>> {
+        let bytes = self.undamaged();
+        let doc = Document::new(&bytes)?;
+        let mut out = Vec::new();
+        for g in doc.groups() {
+            for r in g.records() {
+                out.push(r.values()?.into_iter().map(|v| v.into_owned()).collect());
+            }
+        }
+        Ok(out)
+    }
+
     fn scan(&mut self) {
         let buf = self.buf;
         let len = buf.len();
         let mut pos = 0;
+        let mut block_start = 0;
+        let mut in_text = false;
+        let mut depth = 0usize;
         while pos < len {
-            let byte = buf[pos];
-            if byte == DLE {
-                pos += 2;
-            } else if byte == STX {
-                pos = skip_nested(buf, pos, len);
-            } else if byte == ETB {
-                let etb_pos = pos;
-                pos += 1;
-                while pos < len && buf[pos] >= 0x20 {
-                    pos += 1;
+            let b = buf[pos];
+            if in_text {
+                if b == DLE {
+                    pos += 2;
+                    continue;
+                } else if b == ETX {
+                    in_text = false;
+                } else if b == ETB {
+                    self.commit(block_start, pos, true);
+                    pos = self.payload_end(pos + 1);
+                    block_start = pos;
+                    in_text = false;
+                    depth = 0;
+                    continue;
+                } else if b == SYN || b == EOT || b == EM {
+                    // framing cuts the text; the block is torn or damaged
+                    in_text = false;
+                    depth = 0;
+                    if b == SYN {
+                        block_start = pos;
+                    }
                 }
-                self.commits.push((etb_pos, pos));
-            } else {
                 pos += 1;
+            } else {
+                if b == STX {
+                    in_text = true;
+                } else if b == DLE {
+                    depth += 1;
+                } else if b == CAN {
+                    depth = depth.saturating_sub(1);
+                } else if b == ETB {
+                    self.commit(block_start, pos, depth > 0);
+                    pos = self.payload_end(pos + 1);
+                    block_start = pos;
+                    depth = 0;
+                    continue;
+                } else if b == SYN && pos > 0 {
+                    // tears the uncommitted bytes before it; a new document begins
+                    block_start = pos;
+                    depth = 0;
+                }
+                pos += 1;
+            }
+        }
+        self.torn = self.torn_tail();
+    }
+
+    fn commit(&mut self, start: usize, stop: usize, damaged: bool) {
+        self.blocks.push((start, stop));
+        if damaged {
+            self.damaged.push(self.blocks.len() - 1);
+        }
+    }
+
+    // After an ETB: skip its payload and return committed_end (which
+    // excludes layout after the payload).
+    fn payload_end(&mut self, pos: usize) -> usize {
+        let buf = self.buf;
+        let len = buf.len();
+        let mut p = scan::layout(buf, pos, len);
+        if p < len && buf[p] >= 0x20 {
+            p = scan::plain(buf, p, len);
+            // trailing spaces of the payload are layout
+            while p > pos && buf[p - 1] == SP {
+                p -= 1;
+            }
+        } else {
+            p = pos; // no payload: layout after ETB belongs to the next block
+        }
+        self.committed_end = p;
+        p
+    }
+
+    // Is the tail more than layout, notes and EOT?
+    fn torn_tail(&self) -> bool {
+        let buf = self.buf;
+        let len = buf.len();
+        let mut pos = self.committed_end;
+        loop {
+            pos = scan::layout(buf, pos, len);
+            if pos >= len {
+                return false;
+            }
+            let b = buf[pos];
+            if b == EOT {
+                pos += 1;
+            } else if b == BEL {
+                let p2 = scan::layout(buf, pos + 1, len);
+                if p2 < len && buf[p2] < 0x20 && buf[p2] != STX {
+                    return true; // a dead element is data
+                }
+                match scan::comment(buf, pos, len) {
+                    Ok(p) => pos = p,
+                    Err(_) => return true,
+                }
+            } else {
+                return true;
             }
         }
     }
 }
 
-fn skip_nested(buf: &[u8], mut pos: usize, stop: usize) -> usize {
-    pos += 1; // skip STX
-    let mut depth = 1;
-    while pos < stop && depth > 0 {
-        match buf[pos] {
-            STX => depth += 1,
-            ETX => depth -= 1,
-            DLE => pos += 1,
-            _ => {}
+/// Position just past the last commit, found by scanning backward
+/// (treating an ETB behind an odd run of DLEs as escaped). A shortcut for
+/// well-formed input; the forward scan of [`StreamReader`] is authoritative.
+pub fn last_commit_end(buf: &[u8]) -> usize {
+    let mut i = buf.len();
+    while i > 0 {
+        i -= 1;
+        if buf[i] != ETB {
+            continue;
         }
-        pos += 1;
+        let dles = buf[..i].iter().rev().take_while(|&&b| b == DLE).count();
+        if dles % 2 == 0 {
+            return scan::plain(buf, i + 1, buf.len());
+        }
     }
-    pos
+    0
 }
 
-// Build one block's bytes plus its trailing ETB commit marker.
+// Build one block's bytes plus its trailing ETB.
 fn commit_bytes<F: FnOnce(&mut Builder)>(f: F) -> Vec<u8> {
     let mut b = Builder::new();
     f(&mut b);
@@ -120,10 +263,10 @@ fn commit_bytes<F: FnOnce(&mut Builder)>(f: F) -> Vec<u8> {
     b.into_bytes()
 }
 
-/// Appends ETB-committed blocks to any [`Write`] sink (e.g. an in-memory
-/// buffer or a socket). Each block and its ETB are written as one unit and
-/// flushed. For files, prefer [`open_log`], which repairs a torn tail and can
-/// fsync each commit.
+/// Appends committed blocks to any [`Write`] sink. Each `record`, `map`,
+/// `header`, `group` or `batch` is one block, written with its ETB in a
+/// single append and flushed. For files prefer [`open_log`], which repairs
+/// a torn tail first and can fsync each commit.
 pub struct StreamWriter<W: Write> {
     sink: W,
 }
@@ -133,109 +276,141 @@ impl<W: Write> StreamWriter<W> {
         StreamWriter { sink }
     }
 
-    /// Append one record as a committed block.
-    pub fn record(&mut self, fields: &[&str]) -> io::Result<()> {
-        self.emit(commit_bytes(|b| {
+    /// A new log: SYN and its heading, committed.
+    pub fn start(&mut self, heading: &[(&str, &str)]) -> io::Result<()> {
+        self.batch(|b| {
+            b.syn();
+            for (k, v) in heading {
+                b.heading(k, v);
+            }
+        })
+    }
+
+    /// Append one positional record as a committed block.
+    pub fn record<T: AsRef<[u8]>>(&mut self, fields: &[T]) -> io::Result<()> {
+        self.batch(|b| {
             b.record(fields);
-        }))
+        })
     }
 
-    /// Append an SOH header as a committed block.
+    /// Append one keyed record as a committed block.
+    pub fn map<T: AsRef<[u8]>>(&mut self, pairs: &[(&str, T)]) -> io::Result<()> {
+        self.batch(|b| {
+            b.map(pairs);
+        })
+    }
+
+    /// Append a header row as a committed block.
     pub fn header(&mut self, names: &[&str]) -> io::Result<()> {
-        self.emit(commit_bytes(|b| {
+        self.batch(|b| {
             b.header(names);
-        }))
+        })
     }
 
-    /// Append a group preamble (GS + name) as a committed block.
+    /// Append a group line (and header row) as a committed block.
     pub fn group(&mut self, name: &str, headers: Option<&[&str]>) -> io::Result<()> {
-        self.emit(commit_bytes(|b| {
+        self.batch(|b| {
             b.group(name, headers);
-        }))
+        })
     }
 
-    /// Append several records under a single commit (an atomic batch).
+    /// Several writes under one ETB: atomic as a batch.
     pub fn batch<F: FnOnce(&mut Builder)>(&mut self, f: F) -> io::Result<()> {
-        self.emit(commit_bytes(f))
+        self.sink.write_all(&commit_bytes(f))?;
+        self.sink.flush()
+    }
+
+    pub fn get_ref(&self) -> &W {
+        &self.sink
+    }
+
+    pub fn get_mut(&mut self) -> &mut W {
+        &mut self.sink
     }
 
     /// Recover the underlying sink.
     pub fn into_inner(self) -> W {
         self.sink
     }
-
-    fn emit(&mut self, bytes: Vec<u8>) -> io::Result<()> {
-        self.sink.write_all(&bytes)?;
-        self.sink.flush()
-    }
 }
 
 /// An append-only log file with ETB commits. Each commit is flushed and,
 /// when `sync` is set, fsync'd. Dropping the value closes the file.
 pub struct FileLog {
-    file: File,
+    w: StreamWriter<File>,
     sync: bool,
 }
 
 impl FileLog {
-    /// Append one record as a committed block.
-    pub fn record(&mut self, fields: &[&str]) -> io::Result<()> {
-        self.commit(commit_bytes(|b| {
-            b.record(fields);
-        }))
+    /// A new log: SYN and its heading, committed.
+    pub fn start(&mut self, heading: &[(&str, &str)]) -> io::Result<()> {
+        self.w.start(heading)?;
+        self.sync()
     }
 
-    /// Append an SOH header as a committed block.
+    pub fn record<T: AsRef<[u8]>>(&mut self, fields: &[T]) -> io::Result<()> {
+        self.w.record(fields)?;
+        self.sync()
+    }
+
+    pub fn map<T: AsRef<[u8]>>(&mut self, pairs: &[(&str, T)]) -> io::Result<()> {
+        self.w.map(pairs)?;
+        self.sync()
+    }
+
     pub fn header(&mut self, names: &[&str]) -> io::Result<()> {
-        self.commit(commit_bytes(|b| {
-            b.header(names);
-        }))
+        self.w.header(names)?;
+        self.sync()
     }
 
-    /// Append a group preamble (GS + name) as a committed block.
     pub fn group(&mut self, name: &str, headers: Option<&[&str]>) -> io::Result<()> {
-        self.commit(commit_bytes(|b| {
-            b.group(name, headers);
-        }))
+        self.w.group(name, headers)?;
+        self.sync()
     }
 
-    /// Append several records under a single commit (an atomic batch).
+    /// Several writes under one ETB: atomic as a batch.
     pub fn batch<F: FnOnce(&mut Builder)>(&mut self, f: F) -> io::Result<()> {
-        self.commit(commit_bytes(f))
+        self.w.batch(f)?;
+        self.sync()
     }
 
-    fn commit(&mut self, bytes: Vec<u8>) -> io::Result<()> {
-        self.file.write_all(&bytes)?;
-        self.file.flush()?;
+    fn sync(&mut self) -> io::Result<()> {
         if self.sync {
-            self.file.sync_all()?;
+            self.w.get_mut().sync_all()?;
         }
         Ok(())
     }
 }
 
-/// Open an append-only log file, repairing any torn tail first (truncating to
-/// the last commit). Each commit is fsync'd.
+/// Open an append-only log file, repairing any torn tail first. Each
+/// commit is fsync'd.
 pub fn open_log(path: impl AsRef<Path>) -> io::Result<FileLog> {
     open_log_with(path, true)
 }
 
-/// Like [`open_log`], but with explicit control over per-commit fsync.
+/// Like [`open_log`], with explicit control over per-commit fsync.
 pub fn open_log_with(path: impl AsRef<Path>, sync: bool) -> io::Result<FileLog> {
     let path = path.as_ref();
-
-    // Repair: truncate an uncommitted tail so the log ends at a commit marker.
     if path.exists() {
-        let bytes = fs::read(path)?;
-        let reader = StreamReader::new(&bytes);
-        if reader.torn() {
-            let f = OpenOptions::new().write(true).open(path)?;
-            f.set_len(reader.committed_end() as u64)?;
-        }
+        repair_log(path)?;
     }
-
     let file = OpenOptions::new().create(true).append(true).open(path)?;
-    Ok(FileLog { file, sync })
+    Ok(FileLog {
+        w: StreamWriter::new(file),
+        sync,
+    })
+}
+
+/// Truncate an uncommitted tail so the file ends at a commit.
+pub fn repair_log(path: impl AsRef<Path>) -> io::Result<()> {
+    let path = path.as_ref();
+    let bytes = fs::read(path)?;
+    let r = StreamReader::new(&bytes);
+    if r.torn() {
+        let f = OpenOptions::new().write(true).open(path)?;
+        f.set_len(r.committed_end() as u64)?;
+    }
+    Ok(())
 }
 
 /// Read a log file into a byte buffer; wrap it with [`StreamReader::new`].

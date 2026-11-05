@@ -2,61 +2,77 @@
 
 use crate::*;
 
-/// Convert CSV text to C0DATA compact bytes.
-///
-/// The first row is treated as headers, the rest as records, producing a
-/// single group (`GS` + name + `SOH` headers + `RS` records). Returns an
-/// empty buffer for empty input.
+/// CSV text → one group with a header row and positional records. Returns
+/// an empty buffer for empty input.
 pub fn from_csv(input: &str, group_name: &str) -> Vec<u8> {
     let rows = parse_csv(input);
     if rows.is_empty() {
         return Vec::new();
     }
-    let headers: Vec<&str> = rows[0].iter().map(|s| s.as_str()).collect();
+    let headers: Vec<&str> = rows[0].iter().map(String::as_str).collect();
     Builder::build(|b| {
         b.group(group_name, Some(&headers));
         for row in &rows[1..] {
-            let fields: Vec<&str> = row.iter().map(|s| s.as_str()).collect();
-            b.record(&fields);
+            b.record(row);
         }
     })
 }
 
-/// Convert C0DATA compact bytes to CSV text.
-///
-/// Reads the first table in the buffer (FS-prefixed document or a bare
-/// group): headers, if present, become the first row, then each record.
-pub fn to_csv(buf: &[u8]) -> String {
-    let table = find_table(buf);
-    let mut out = String::new();
-
-    if table.header_count() > 0 {
-        let row: Vec<String> = (0..table.header_count())
-            .map(|i| csv_quote(&String::from_utf8_lossy(table.header(i))))
-            .collect();
-        out.push_str(&row.join(","));
-        out.push('\n');
-    }
-    for rec in table.records() {
-        let row: Vec<String> = (0..rec.field_count())
-            .map(|i| csv_quote(&String::from_utf8_lossy(&rec.value(i))))
-            .collect();
-        out.push_str(&row.join(","));
-        out.push('\n');
-    }
-    out
+/// The first group of the buffer as CSV text (header row first when
+/// present). A reference is written as its path (`tags/001`); a nested
+/// level has no CSV form and is an error.
+pub fn to_csv(buf: &[u8]) -> Result<String> {
+    to_csv_group(buf, None)
 }
 
-// Find the first table in the buffer: a Document group if FS-prefixed, else
-// a bare Table.
-fn find_table(buf: &[u8]) -> Table<'_> {
-    if buf.first() == Some(&FS) {
-        let doc = Document::new(buf);
-        if doc.group_count() > 0 {
-            return doc.group(0).table();
-        }
+/// The named group (or the first) as CSV text; see [`to_csv`].
+pub fn to_csv_group(buf: &[u8], group_name: Option<&str>) -> Result<String> {
+    let doc = Document::new(buf)?;
+    let g = match group_name {
+        Some(name) => doc
+            .groups()
+            .find(|g| g.name() == name.as_bytes())
+            .ok_or_else(|| Error::Key(format!("no group named '{name}'")))?,
+        None => doc
+            .groups()
+            .next()
+            .ok_or_else(|| Error::other("no group in buffer"))?,
+    };
+    let mut out = String::new();
+    if g.has_header() {
+        let row: Vec<String> = g
+            .headers()
+            .iter()
+            .map(|h| csv_quote(&String::from_utf8_lossy(h)))
+            .collect();
+        out.push_str(&row.join(","));
+        out.push('\n');
     }
-    Table::new(buf)
+    for rec in g.records() {
+        let mut row = Vec::new();
+        for (i, f) in rec.fields().into_iter().enumerate() {
+            if is_level(f) {
+                return Err(Error::other(format!(
+                    "CSV cannot carry a nested level (group '{}', field {})",
+                    String::from_utf8_lossy(g.name()),
+                    i + 1
+                )));
+            } else if is_reference(f) {
+                let r = Reference::parse(f)?;
+                let segs: Vec<String> = r
+                    .path()
+                    .iter()
+                    .map(|s| String::from_utf8_lossy(s).into_owned())
+                    .collect();
+                row.push(csv_quote(&segs.join("/")));
+            } else {
+                row.push(csv_quote(&String::from_utf8_lossy(&value(f)?)));
+            }
+        }
+        out.push_str(&row.join(","));
+        out.push('\n');
+    }
+    Ok(out)
 }
 
 // Minimal RFC 4180 CSV parser: comma-separated, `"`-quoted fields with
@@ -66,7 +82,7 @@ fn parse_csv(input: &str) -> Vec<Vec<String>> {
     let mut row: Vec<String> = Vec::new();
     let mut field = String::new();
     let mut in_quotes = false;
-    let mut started = false; // any char seen on the current (pending) row
+    let mut started = false;
     let mut chars = input.chars().peekable();
 
     while let Some(ch) = chars.next() {
@@ -96,7 +112,6 @@ fn parse_csv(input: &str) -> Vec<Vec<String>> {
             }
         }
     }
-
     if started || !field.is_empty() || !row.is_empty() {
         row.push(field);
         rows.push(row);

@@ -2,13 +2,17 @@
 //!
 //! The intermediate [`Value`] tree and the [`to_value`]/[`from_value`]
 //! conversions are dependency-free and always available. The JSON *text*
-//! helpers ([`to_json`]/[`from_json`]) require the `json` feature, which pulls
-//! in `serde_json` for parsing and serializing — everyone else pays nothing.
+//! helpers ([`to_json`]/[`from_json`]) need the `json` feature, which pulls
+//! in `serde_json`.
+//!
+//! Export never guesses: a positional record is an array, a keyed record
+//! an object, a group with a header row an array of objects, a reference
+//! `{"$ref": "group/record/field"}`.
 
 use crate::*;
 
-/// An intermediate data tree (mirrors the Crystal `Value = String | Array |
-/// Hash`). All scalars are strings; objects preserve insertion order.
+/// An intermediate data tree. All scalars are strings; objects keep
+/// insertion order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Value {
     Str(String),
@@ -16,408 +20,320 @@ pub enum Value {
     Object(Vec<(String, Value)>),
 }
 
-fn bytes_to_string(b: &[u8]) -> String {
+fn s(b: &[u8]) -> String {
     String::from_utf8_lossy(b).into_owned()
-}
-
-fn unescape_string(b: &[u8]) -> String {
-    String::from_utf8_lossy(&unescape(b)).into_owned()
 }
 
 // --- Export: C0DATA → Value ---
 
-/// Build an intermediate [`Value`] tree from C0DATA bytes, detecting whether
-/// the data is tabular, key-value, nested, or document-shaped.
-pub fn to_value(buf: &[u8]) -> Value {
-    match buf.first() {
-        Some(&FS) => export_document(&Document::new(buf)),
-        Some(&GS) => {
-            let t = Table::new(buf);
-            Value::Object(vec![(bytes_to_string(t.name()), export_group_data(&t))])
+/// Build a [`Value`] tree from C0DATA bytes (the first document's body).
+pub fn to_value(buf: &[u8]) -> Result<Value> {
+    let doc = Document::new(buf)?;
+    export_body(doc.body(), false)
+}
+
+/// A body: `{file => groups}` per named file, or the groups directly; a
+/// bare body (one unnamed group) exports as that group.
+pub fn export_body(body: &Body<'_>, level: bool) -> Result<Value> {
+    let files = body.files();
+    if files.len() == 1 {
+        let f = &files[0];
+        if f.name().is_empty() {
+            return export_groups(f.groups(), level);
         }
-        _ => Value::Object(vec![]),
+        return Ok(Value::Object(vec![(
+            s(f.name()),
+            export_groups(f.groups(), level)?,
+        )]));
     }
+    let mut out = Vec::new();
+    for f in files {
+        out.push((s(f.name()), export_groups(f.groups(), level)?));
+    }
+    Ok(Value::Object(out))
 }
 
-fn export_document(doc: &Document) -> Value {
-    let name = bytes_to_string(doc.name());
-    let mut groups = Vec::new();
-    for g in doc.groups() {
-        groups.push((bytes_to_string(g.name()), export_group_data(&g.table())));
+fn export_groups(groups: &[Group<'_>], level: bool) -> Result<Value> {
+    if groups.is_empty() {
+        return Ok(Value::Array(Vec::new()));
     }
-    if name.is_empty() {
-        Value::Object(groups)
-    } else {
-        Value::Object(vec![(name, Value::Object(groups))])
+    if groups.len() == 1 && groups[0].name().is_empty() && groups[0].depth() == 0 {
+        return export_group(&groups[0], level);
     }
+    let mut out = Vec::new();
+    for g in groups {
+        out.push((s(g.name()), export_group(g, false)?));
+    }
+    Ok(Value::Object(out))
 }
 
-fn export_group_data(t: &Table) -> Value {
-    if t.header_count() > 0 {
-        export_table(t)
-    } else if t.record_count() > 0 && t.record(0).field_count() == 2 {
-        export_kv(t)
-    } else if t.record_count() > 0 {
-        export_records(t)
-    } else {
-        Value::Array(vec![])
-    }
-}
-
-// Tabular: array of objects with header keys.
-fn export_table(t: &Table) -> Value {
-    let headers: Vec<String> = (0..t.header_count())
-        .map(|i| bytes_to_string(t.header(i)))
-        .collect();
-    let mut rows = Vec::new();
-    for rec in t.records() {
-        let mut row = Vec::new();
-        for (i, h) in headers.iter().enumerate() {
-            row.push((h.clone(), field_to_value(rec.field(i))));
-        }
-        rows.push(Value::Object(row));
-    }
-    Value::Array(rows)
-}
-
-// Key-value: flat object (records of exactly two fields).
-fn export_kv(t: &Table) -> Value {
-    let mut obj = Vec::new();
-    for rec in t.records() {
-        obj.push((unescape_string(rec.field(0)), field_to_value(rec.field(1))));
-    }
-    Value::Object(obj)
-}
-
-// Raw records: array of arrays.
-fn export_records(t: &Table) -> Value {
-    let mut rows = Vec::new();
-    for rec in t.records() {
-        let fields = (0..rec.field_count())
-            .map(|i| field_to_value(rec.field(i)))
-            .collect();
-        rows.push(Value::Array(fields));
-    }
-    Value::Array(rows)
-}
-
-// A field's bytes → Value. A field opening with STX is a nested structure.
-fn field_to_value(field: &[u8]) -> Value {
-    if field.first() == Some(&STX) {
-        parse_nested_field(field)
-    } else {
-        Value::Str(unescape_string(field))
-    }
-}
-
-// Parse a nested field (STX … ETX): RS inside ⇒ key-value object, else array.
-fn parse_nested_field(field: &[u8]) -> Value {
-    let mut stop = field.len();
-    if stop > 0 && field[stop - 1] == ETX {
-        stop -= 1;
-    }
-    let start = 1.min(field.len()); // skip STX
-
-    let mut has_rs = false;
-    let mut scan = start;
-    while scan < stop {
-        match field[scan] {
-            RS => {
-                has_rs = true;
-                break;
-            }
-            STX => scan = skip_nested_bytes(field, scan, stop),
-            DLE => scan += 2,
-            _ => scan += 1,
-        }
-    }
-
-    if has_rs {
-        parse_nested_kv(field, start, stop)
-    } else {
-        parse_nested_array(field, start, stop)
-    }
-}
-
-fn parse_nested_kv(field: &[u8], mut pos: usize, stop: usize) -> Value {
-    let mut obj: Vec<(String, Value)> = Vec::new();
-    while pos < stop {
-        if field[pos] == RS {
-            pos += 1;
-            let key_start = pos;
-            while pos < stop && field[pos] != US {
-                if field[pos] == DLE {
-                    pos += 2;
-                } else {
-                    pos += 1;
-                }
-            }
-            let key = unescape_string(&field[key_start..pos.min(stop)]);
-            if pos < stop && field[pos] == US {
-                pos += 1;
-                let val_start = pos;
-                while pos < stop && field[pos] != RS {
-                    if field[pos] == STX {
-                        pos = skip_nested_bytes(field, pos, stop);
-                    } else if field[pos] == DLE {
-                        pos += 2;
-                    } else {
-                        pos += 1;
-                    }
-                }
-                obj.push((key, field_to_value(&field[val_start..pos.min(stop)])));
+/// A group: with a header row, an array of objects; a single keyed record
+/// is an object; otherwise an array of its records.
+pub fn export_group(g: &Group<'_>, level: bool) -> Result<Value> {
+    if g.has_header() {
+        let headers: Vec<String> = g.headers().iter().map(|h| s(h)).collect();
+        let mut rows = Vec::new();
+        for rec in g.records() {
+            if rec.keyed() {
+                rows.push(export_record(rec)?);
             } else {
-                obj.push((key, Value::Str(String::new())));
-            }
-        } else {
-            pos += 1;
-        }
-    }
-    Value::Object(obj)
-}
-
-fn parse_nested_array(field: &[u8], mut pos: usize, stop: usize) -> Value {
-    let mut items = Vec::new();
-    while pos < stop {
-        if field[pos] == US {
-            pos += 1;
-            let item_start = pos;
-            while pos < stop && field[pos] != US {
-                if field[pos] == STX {
-                    pos = skip_nested_bytes(field, pos, stop);
-                } else if field[pos] == DLE {
-                    pos += 2;
-                } else {
-                    pos += 1;
+                let n = rec.field_count();
+                let mut row = Vec::new();
+                for (i, h) in headers.iter().enumerate() {
+                    let v = if i < n {
+                        export_raw(rec.field(i))?
+                    } else {
+                        Value::Str(String::new())
+                    };
+                    row.push((h.clone(), v));
                 }
+                rows.push(Value::Object(row));
             }
-            items.push(field_to_value(&field[item_start..pos.min(stop)]));
-        } else {
-            pos += 1;
         }
+        return Ok(Value::Array(rows));
     }
-    Value::Array(items)
+    let recs = g.records();
+    if recs.len() == 1 && (recs[0].keyed() || level) {
+        return export_record(&recs[0]);
+    }
+    recs.iter()
+        .map(export_record)
+        .collect::<Result<Vec<_>>>()
+        .map(Value::Array)
 }
 
-fn skip_nested_bytes(buf: &[u8], mut pos: usize, stop: usize) -> usize {
-    pos += 1; // skip STX
-    let mut depth = 1;
-    while pos < stop && depth > 0 {
-        match buf[pos] {
-            STX => depth += 1,
-            ETX => depth -= 1,
-            DLE => pos += 1,
-            _ => {}
+/// A record: a keyed record is an object (last value wins for a duplicate
+/// key), a positional one an array.
+pub fn export_record(rec: &Record<'_>) -> Result<Value> {
+    if rec.keyed() {
+        let mut obj: Vec<(String, Value)> = Vec::new();
+        for (k, _) in rec.pairs()? {
+            let key = s(k);
+            let v = export_raw(rec.get_raw(&key).unwrap_or(&[]))?;
+            match obj.iter_mut().find(|(ok, _)| *ok == key) {
+                Some(slot) => slot.1 = v,
+                None => obj.push((key, v)),
+            }
         }
-        pos += 1;
+        Ok(Value::Object(obj))
+    } else {
+        rec.fields()
+            .into_iter()
+            .map(export_raw)
+            .collect::<Result<Vec<_>>>()
+            .map(Value::Array)
     }
-    pos
+}
+
+fn export_raw(raw: &[u8]) -> Result<Value> {
+    if is_level(raw) {
+        export_body(&Body::of_level(raw)?, true)
+    } else if is_reference(raw) {
+        let r = Reference::parse(raw)?;
+        let path: Vec<String> = r.path().iter().map(|seg| s(seg)).collect();
+        Ok(Value::Object(vec![(
+            "$ref".to_string(),
+            Value::Str(path.join("/")),
+        )]))
+    } else {
+        Ok(Value::Str(s(&value(raw)?)))
+    }
 }
 
 // --- Import: Value → C0DATA ---
 
-/// Emit a [`Value`] tree as C0DATA compact bytes.
+/// Emit a [`Value`] tree as canonical C0DATA bytes. An object of groups
+/// becomes groups (one key wrapping an object of groups becomes a file);
+/// an array becomes one group named `group_name`; an object of scalars one
+/// group holding one map; a scalar one record.
 pub fn from_value(value: &Value, group_name: &str) -> Vec<u8> {
-    let mut out = Vec::new();
-    emit_root(value, group_name, &mut out);
-    out
-}
-
-fn emit_root(value: &Value, group_name: &str, out: &mut Vec<u8>) {
-    match value {
+    Builder::build(|b| match value {
         Value::Object(pairs) => {
-            if all_scalar(pairs) {
-                write_group(group_name, out);
-                for (k, v) in pairs {
-                    out.push(RS);
-                    write_escaped(k, out);
-                    out.push(US);
-                    write_escaped(as_str(v), out);
+            if let [(name, Value::Object(inner))] = pairs.as_slice() {
+                if all_groupable(inner) {
+                    b.file(name);
+                    emit_groups(b, inner);
+                    return;
                 }
-            } else if pairs.len() == 1 {
-                let (key, inner) = &pairs[0];
-                if let Value::Object(ip) = inner {
-                    if all_groupable(ip) {
-                        out.push(FS);
-                        out.extend_from_slice(key.as_bytes());
-                        emit_hash_as_groups(ip, out);
-                        return;
-                    }
-                }
-                emit_hash_as_groups(pairs, out);
+            }
+            if all_groupable(pairs) {
+                emit_groups(b, pairs);
             } else {
-                emit_hash_as_groups(pairs, out);
+                b.group(group_name, None);
+                emit_map(b, pairs);
             }
         }
-        Value::Array(items) => emit_array_as_group(items, group_name, out),
-        Value::Str(s) => {
-            write_group(group_name, out);
-            out.push(RS);
-            write_escaped(s, out);
+        Value::Array(items) => emit_array_as_group(b, items, group_name),
+        Value::Str(text) => {
+            b.group(group_name, None);
+            b.record(&[text]);
         }
-    }
+    })
 }
 
-fn emit_hash_as_groups(pairs: &[(String, Value)], out: &mut Vec<u8>) {
+fn emit_groups(b: &mut Builder, pairs: &[(String, Value)]) {
     for (name, value) in pairs {
         match value {
             Value::Object(inner) => {
-                write_group(name, out);
-                let scalar = all_scalar(inner);
-                for (k, v) in inner {
-                    out.push(RS);
-                    write_escaped(k, out);
-                    out.push(US);
-                    if scalar {
-                        write_escaped(as_str(v), out);
-                    } else {
-                        emit_field_value(v, out);
-                    }
-                }
+                b.group(name, None);
+                emit_map(b, inner);
             }
-            Value::Array(arr) => emit_array_as_group(arr, name, out),
-            Value::Str(s) => {
-                write_group(name, out);
-                out.push(RS);
-                write_escaped(s, out);
+            Value::Array(items) => emit_array_as_group(b, items, name),
+            Value::Str(text) => {
+                b.group(name, None);
+                b.record(&[text]);
             }
         }
     }
 }
 
-fn emit_array_as_group(arr: &[Value], name: &str, out: &mut Vec<u8>) {
-    if tabular(arr) {
-        let headers: Vec<&String> = match &arr[0] {
-            Value::Object(p) => p.iter().map(|(k, _)| k).collect(),
-            _ => Vec::new(),
-        };
-        write_group(name, out);
-        out.push(SOH);
-        for (i, h) in headers.iter().enumerate() {
-            if i > 0 {
-                out.push(US);
+// An object → one keyed record, entries in object order.
+fn emit_map(b: &mut Builder, pairs: &[(String, Value)]) {
+    b.begin_record();
+    for (k, v) in pairs {
+        match v {
+            Value::Str(text) => {
+                b.key(k, text);
             }
-            out.extend_from_slice(h.as_bytes());
+            other => {
+                b.key_level(k, |b| emit_level_body(b, other));
+            }
         }
+    }
+}
+
+fn emit_array_as_group(b: &mut Builder, arr: &[Value], name: &str) {
+    if let Some(headers) = tabular(arr) {
+        let refs: Vec<&str> = headers.iter().map(String::as_str).collect();
+        b.group(name, Some(&refs));
         for row in arr {
             if let Value::Object(p) = row {
-                out.push(RS);
-                for (i, key) in headers.iter().enumerate() {
-                    if i > 0 {
-                        out.push(US);
-                    }
-                    if let Some((_, v)) = p.iter().find(|(k, _)| &k == key) {
-                        emit_field_value(v, out);
-                    }
+                b.begin_record();
+                for k in &headers {
+                    emit_unit(b, lookup(p, k));
                 }
             }
         }
     } else {
-        write_group(name, out);
+        b.group(name, None);
         for item in arr {
-            match item {
-                Value::Str(s) => {
-                    out.push(RS);
-                    write_escaped(s, out);
-                }
-                Value::Array(a) => {
-                    out.push(RS);
-                    for (i, v) in a.iter().enumerate() {
-                        if i > 0 {
-                            out.push(US);
-                        }
-                        emit_field_value(v, out);
-                    }
-                }
-                Value::Object(p) => {
-                    for (k, v) in p {
-                        out.push(RS);
-                        write_escaped(k, out);
-                        out.push(US);
-                        emit_field_value(v, out);
-                    }
-                }
-            }
+            emit_item_as_record(b, item);
         }
     }
 }
 
-// Emit a value as a record field: scalars directly; nested values in STX/ETX.
-fn emit_field_value(value: &Value, out: &mut Vec<u8>) {
+fn emit_item_as_record(b: &mut Builder, item: &Value) {
+    match item {
+        Value::Str(text) => {
+            b.record(&[text]);
+        }
+        Value::Array(items) => {
+            b.begin_record();
+            for v in items {
+                emit_unit(b, v);
+            }
+        }
+        Value::Object(pairs) => emit_map(b, pairs),
+    }
+}
+
+// A value in unit position: a scalar, or a level.
+fn emit_unit(b: &mut Builder, value: &Value) {
     match value {
-        Value::Str(s) => write_escaped(s, out),
-        Value::Object(p) => {
-            out.push(STX);
-            for (k, v) in p {
-                out.push(RS);
-                write_escaped(k, out);
-                out.push(US);
-                emit_field_value(v, out);
+        Value::Str(text) => {
+            b.field(text);
+        }
+        other => {
+            b.level(|b| emit_level_body(b, other));
+        }
+    }
+}
+
+// Inside a level: an array of scalars is one record (a list); an array of
+// uniform objects a table with a header row; an array of arrays a table; a
+// mixed array one record per item; an object a map.
+fn emit_level_body(b: &mut Builder, value: &Value) {
+    match value {
+        Value::Object(pairs) => emit_map(b, pairs),
+        Value::Array(items) => {
+            if items.iter().all(|v| matches!(v, Value::Str(_))) {
+                b.begin_record();
+                for v in items {
+                    if let Value::Str(text) = v {
+                        b.field(text);
+                    }
+                }
+            } else if let Some(headers) = tabular(items) {
+                let refs: Vec<&str> = headers.iter().map(String::as_str).collect();
+                b.header(&refs);
+                for row in items {
+                    if let Value::Object(p) = row {
+                        b.begin_record();
+                        for k in &headers {
+                            emit_unit(b, lookup(p, k));
+                        }
+                    }
+                }
+            } else if items.iter().all(|v| matches!(v, Value::Array(_))) {
+                for row in items {
+                    if let Value::Array(cells) = row {
+                        b.begin_record();
+                        for v in cells {
+                            emit_unit(b, v);
+                        }
+                    }
+                }
+            } else {
+                for item in items {
+                    emit_item_as_record(b, item);
+                }
             }
-            out.push(ETX);
         }
-        Value::Array(a) => {
-            out.push(STX);
-            for item in a {
-                out.push(US);
-                emit_field_value(item, out);
-            }
-            out.push(ETX);
+        Value::Str(text) => {
+            b.record(&[text]);
         }
     }
 }
 
-fn write_group(name: &str, out: &mut Vec<u8>) {
-    out.push(GS);
-    out.extend_from_slice(name.as_bytes());
-}
+static EMPTY: Value = Value::Str(String::new());
 
-fn write_escaped(s: &str, out: &mut Vec<u8>) {
-    for &byte in s.as_bytes() {
-        if byte < 0x20 {
-            out.push(DLE);
-        }
-        out.push(byte);
-    }
-}
-
-fn as_str(v: &Value) -> &str {
-    match v {
-        Value::Str(s) => s,
-        _ => "",
-    }
-}
-
-fn all_scalar(pairs: &[(String, Value)]) -> bool {
-    pairs.iter().all(|(_, v)| matches!(v, Value::Str(_)))
+fn lookup<'v>(pairs: &'v [(String, Value)], key: &str) -> &'v Value {
+    pairs
+        .iter()
+        .find(|(k, _)| k == key)
+        .map_or(&EMPTY, |(_, v)| v)
 }
 
 fn all_groupable(pairs: &[(String, Value)]) -> bool {
-    pairs
-        .iter()
-        .all(|(_, v)| matches!(v, Value::Object(_) | Value::Array(_)))
+    !pairs.is_empty()
+        && pairs
+            .iter()
+            .all(|(_, v)| matches!(v, Value::Object(_) | Value::Array(_)))
 }
 
-fn tabular(arr: &[Value]) -> bool {
-    let keys: Vec<&String> = match arr.first() {
-        Some(Value::Object(p)) => p.iter().map(|(k, _)| k).collect(),
-        _ => return false,
+// The shared keys of an array of uniform objects, or None.
+fn tabular(arr: &[Value]) -> Option<Vec<String>> {
+    let keys: Vec<String> = match arr.first()? {
+        Value::Object(p) => p.iter().map(|(k, _)| k.clone()).collect(),
+        _ => return None,
     };
-    arr.iter().all(|item| match item {
-        Value::Object(p) => p.iter().map(|(k, _)| k).collect::<Vec<_>>() == keys,
+    let uniform = arr.iter().all(|item| match item {
+        Value::Object(p) => p.iter().map(|(k, _)| k).eq(keys.iter()),
         _ => false,
-    })
+    });
+    uniform.then_some(keys)
 }
 
 // --- JSON text (requires the `json` feature) ---
 
-/// Convert C0DATA bytes to a pretty JSON string. Requires the `json` feature.
+/// C0DATA bytes → pretty JSON text. Requires the `json` feature.
 #[cfg(feature = "json")]
-pub fn to_json(buf: &[u8]) -> String {
-    serde_json::to_string_pretty(&to_serde(&to_value(buf))).unwrap()
+pub fn to_json(buf: &[u8]) -> Result<String> {
+    let v = to_value(buf)?;
+    Ok(serde_json::to_string_pretty(&to_serde(&v)).expect("a Value tree serializes"))
 }
 
-/// Convert a JSON string to C0DATA compact bytes. Requires the `json` feature.
+/// JSON text → canonical C0DATA bytes. Requires the `json` feature.
 #[cfg(feature = "json")]
 pub fn from_json(input: &str, group_name: &str) -> std::result::Result<Vec<u8>, serde_json::Error> {
     let sv: serde_json::Value = serde_json::from_str(input)?;
@@ -427,7 +343,7 @@ pub fn from_json(input: &str, group_name: &str) -> std::result::Result<Vec<u8>, 
 #[cfg(feature = "json")]
 fn to_serde(v: &Value) -> serde_json::Value {
     match v {
-        Value::Str(s) => serde_json::Value::String(s.clone()),
+        Value::Str(text) => serde_json::Value::String(text.clone()),
         Value::Array(a) => serde_json::Value::Array(a.iter().map(to_serde).collect()),
         Value::Object(p) => {
             let mut m = serde_json::Map::new();
@@ -449,7 +365,7 @@ fn from_serde(v: &serde_json::Value) -> Value {
                 .collect(),
         ),
         J::Array(a) => Value::Array(a.iter().map(from_serde).collect()),
-        J::String(s) => Value::Str(s.clone()),
+        J::String(text) => Value::Str(text.clone()),
         J::Null => Value::Str(String::new()),
         other => Value::Str(other.to_string()),
     }
