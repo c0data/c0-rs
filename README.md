@@ -1,35 +1,42 @@
 # c0
 
 A Rust implementation of [C0DATA](https://github.com/c0data) — structured
-data built on ASCII C0 control codes. Values are plain UTF-8 text; structure is
-expressed through single-byte control codes (FS/GS/RS/US separators, SOH
-headers, STX/ETX nesting, DLE escape, ETB stream commits).
+data built on ASCII C0 control codes. Values are UTF-8 text (any bytes, as
+text); structure is sixteen single-byte codes: FS/GS/RS/US separators, SOH
+keys and header rows, STX…ETX text, DLE…CAN nesting, ENQ references, BEL
+comments, SYN/EOT document framing, ETB stream commits, EM trailing blobs.
 
-This crate is a **zero-copy** reader/writer: accessors borrow the input buffer
-and return slices (`&[u8]`) into it, decoding escapes only on demand
+This crate is a **zero-copy** reader/writer: readers index a buffer once and
+hand back slices (`&[u8]`) into it, decoding text only on demand
 (`Cow<[u8]>`). It has **no dependencies**.
 
 ## Status
 
-Port of the Crystal reference (`c0-cr`):
+Implements the 1.0 redesign of the spec, mirroring the Crystal reference
+(`c0-cr`):
 
-- tokenizer, table/record and document/group navigation, builder
-- canonical-form helpers, ETB stream mode
-- pretty form: compact, aligned, and spaced layouts + round-tripping parse
+- scanning primitives, validator (`validate`, `canonical`)
+- `Container` / `Document` / `Body` / `Group` / `Record` / `Reference` readers,
+  `Builder` writer
+- stream mode: `StreamReader` (commits, damaged blocks, torn tail),
+  `StreamWriter`, `FileLog` with tail repair and fsync
+- pretty form: compact, aligned and spaced layouts, and the round-tripping
+  `parse`
 - CSV ⇄ C0DATA conversion
-- C0DIFF: parse, build, and atomic multi-file apply
+- C0-DIFF: parse, build, and atomic multi-file apply (sections and
+  replace-all)
 - JSON: the `Value` tree and `to_value`/`from_value` (dependency-free), with
   `to_json`/`from_json` text helpers behind the optional `json` feature
 
-It passes the shared language-agnostic conformance vectors from
-[c0-spec](https://github.com/c0data/c0-spec), included here as a git submodule
-at `c0-spec/`. After cloning:
+It passes every case of the shared conformance vectors from
+[c0-spec](https://github.com/c0data/c0-spec), read from the git submodule at
+`c0-spec/`. After cloning:
 
 ```sh
 git submodule update --init
 ```
 
-Not yet ported: a YAML converter and a serde-style derive (the `Serializable`
+Not ported: a YAML converter and a serde-style derive (the `Serializable`
 equivalent).
 
 ## Features
@@ -38,18 +45,15 @@ The library is dependency-free by default. The optional `json` feature adds
 JSON *text* conversion and pulls in `serde_json`:
 
 ```toml
-c0 = { version = "0.2", features = ["json"] }
+c0 = { version = "1.0.0-dev", features = ["json"] }
 ```
-
-`json::to_value`/`from_value` (C0DATA ⇄ an in-memory tree) need no feature and
-no dependency; only the JSON-text helpers do.
 
 ## Usage
 
 ```rust
-use c0::{Builder, Table, Document, canonical};
+use c0::{Builder, Body, canonical};
 
-// Build compact bytes
+// Build canonical compact bytes: ␝users␁␞name␟amount␞Alice␟1502.30␞Bob␟340.00
 let buf = Builder::build(|b| {
     b.group("users", Some(&["name", "amount"]));
     b.record(&["Alice", "1502.30"]);
@@ -57,56 +61,97 @@ let buf = Builder::build(|b| {
 });
 
 // Read them back, zero-copy
-let t = Table::new(&buf);
-assert_eq!(t.record(0).field(0), b"Alice");
+let body = Body::new(&buf)?;
+let users = body.group(0);
+assert_eq!(users.headers(), [b"name".as_slice(), b"amount"]);
+assert_eq!(users.record(0).value(0)?.as_ref(), b"Alice");
 
-// Compact form is canonical — hashable for content addressing
+// The builder's output is canonical — hashable for content addressing
 assert!(canonical(&buf));
 ```
 
-Value writers (`record`, `field`, `list_field`, `block`, `item`) take any
-`AsRef<[u8]>`, so `&str` and `&[u8]` both work and raw bytes round-trip.
+Values (`record`, `field`, `list`, `key`, `map`) take any `AsRef<[u8]>` and are
+written in their one spelling: plain when they have no byte below 0x20 and no
+edge whitespace, otherwise text `␂…␃` with only STX, ETX, DLE, ETB, EOT, SYN
+and EM escaped. Names (labels, keys, header names) are identifiers and panic
+when they are not.
 
-### List fields
-
-A field whose value is a flat list is written as US-separated items inside
-STX/ETX (`␂Admin␟Editor␃`). `list_field` writes one; `Record::list` reads it
-back as unescaped items.
+### Keyed records and nesting
 
 ```rust
 let buf = c0::Builder::build(|b| {
-    b.group("users", None);
-    b.record(&["Alice"]);
-    b.list_field(&["Admin", "Editor"]);   // one field: ␂Admin␟Editor␃
+    b.group("server", None);
+    b.begin_record();
+    b.key("host", "0.0.0.0");                       // ␞␁host␟0.0.0.0
+    b.key("port", "8080");                          // ␁port␟8080
+    b.key_level("origins", |b| {                    // ␁origins␟␐␞localhost␟example.com␘
+        b.record(&["localhost", "example.com"]);
+    });
 });
-let t = c0::Table::new(&buf);
-let roles = t.record(0).list(1);          // Vec<Cow<[u8]>>: [b"Admin", b"Editor"]
-assert_eq!(&*roles[0], b"Admin");
+let body = c0::Body::new(&buf)?;
+let server = body.group(0).record(0);
+assert_eq!(server.get("port")?.unwrap().as_ref(), b"8080");
+let origins = server.get_level("origins")?.unwrap();
+assert_eq!(origins.record(0).values()?.len(), 2);
 ```
+
+A positional unit holding a level is read with `Record::level` (any body) or
+`Record::list` (a level holding one positional record, written with
+`Builder::list`). A reference (`␅tags`, `␅␂tags␟001␃`) is written with
+`reference`/`reference_path` and read with `Record::reference`.
+
+### Documents
+
+```rust
+let buf = c0::Builder::build(|b| {
+    b.syn().heading("shape", "tabular");            // ␖␁shape␟tabular
+    b.file("mydb");                                 // ␜mydb
+    b.group("users", Some(&["name"]));              // ␝users␁␞name
+    b.record(&["Alice"]);
+    b.eot();                                        // ␄
+});
+let doc = c0::Document::new(&buf)?;
+assert_eq!(doc.shape(), Some("tabular"));
+assert!(doc.warnings().is_empty());                 // a missing SYN or EOT warns, never fails
+```
+
+`Container::new` reads a buffer of several documents and the raw region after
+EM (`blob_bytes(name)` looks a blob up through the first heading's `blob`
+table). `validate` rejects malformed bytes; `canonical` tells whether bytes
+are a canonical unit.
 
 ### Stream logs (ETB commits)
 
 ```rust
-use c0::{open_log, read_log, StreamReader};
+use c0::{open_log, read_log, StreamReader, Document};
 
-let mut log = open_log("claims.c0")?;   // repairs a torn tail first
+let mut log = open_log("events.c0")?;   // truncates a torn tail first
+log.start(&[("shape", "stream")])?;     // ␖␁shape␟stream␗
 log.record(&["create", "a1b2", "1718208000"])?;
-log.batch(|b| {                          // atomic multi-record commit
+log.batch(|b| {                          // one commit for several records
     b.record(&["name", "draft"]);
     b.record(&["tag", "alpha"]);
 })?;
 
-let bytes = read_log("claims.c0")?;
+let bytes = read_log("events.c0")?;
 let r = StreamReader::new(&bytes);
-assert!(!r.torn());                       // any torn trailing append is skipped
-for rec in r.table().records() { /* ... */ }
+assert!(!r.torn());                       // an uncommitted tail is skipped
+let committed = r.undamaged();            // blocks cut by a stray ETB are dropped
+let doc = Document::new(&committed)?;
 ```
+
+### Pretty form
+
+`format`/`format_mode` render compact bytes with Control Picture glyphs,
+line breaks and indentation (`FormatMode::{Compact, Aligned, Spaced}`);
+`parse` reads them back. A value containing a glyph character is refused.
 
 ## Development
 
 ```sh
-cargo test     # unit, integration, and conformance vectors
-cargo clippy
+cargo test                                # unit, integration, and conformance vectors
+cargo test --all-features
+cargo clippy --all-targets --all-features
 cargo fmt
 ```
 

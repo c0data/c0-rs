@@ -1,8 +1,8 @@
 [package]
 name = "c0"
-version = "0.2.1"
+version = "1.0.0-dev"
 edition = "2021"
-rust-version = "1.70"
+rust-version = "1.82"
 authors = ["Thomas Sawyer <transfire@gmail.com>"]
 license = "MIT"
 description = "C0DATA — structured data using ASCII C0 control codes"
