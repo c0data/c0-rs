@@ -221,6 +221,8 @@ impl<'a> StreamReader<'a> {
             let b = buf[pos];
             if b == EOT {
                 pos += 1;
+            } else if b == EM {
+                return false; // the raw region is not data of the log
             } else if b == BEL {
                 let p2 = scan::layout(buf, pos + 1, len);
                 if p2 < len && buf[p2] < 0x20 && buf[p2] != STX {

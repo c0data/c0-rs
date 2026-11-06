@@ -709,6 +709,9 @@ impl<'a> Reference<'a> {
             if segs.iter().any(|s| s.is_empty()) {
                 return Err(Error::syntax("reference path with an empty segment", p));
             }
+            if segs.iter().any(|s| !is_name(s)) {
+                return Err(Error::syntax("reference path segment is not a name", p));
+            }
             Ok(Reference { path: segs })
         } else {
             let name = trim(&t[p..]);
