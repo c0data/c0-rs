@@ -15,12 +15,14 @@ use crate::*;
 /// ```
 ///
 /// Two layers. The primitives are one method per code (`fs`, `gs`, `rs`,
-/// `us`, `soh`, `dle`, `can`, `bel`, `enq`, `syn`, `eot`, `etb`, `em`); each
+/// `us`, `sub`, `soh`, `dle`, `can`, `bel`, `enq`, `syn`, `eot`, `etb`,
+/// `em`); each
 /// writes its code and, when given, what grammatically follows it, so a
 /// chain reads like the bytes. Rust has no optional arguments, so the codes
 /// that may stand bare come in two spellings: the bare code (`rs()`, `us()`,
-/// `gs()`, `soh()`, `bel()`, `etb()`) and the code with what follows it
-/// (`rs_value`, `us_value`, `gs_name`, `soh_key`, `bel_note`, `etb_payload`):
+/// `sub()`, `gs()`, `soh()`, `bel()`, `etb()`) and the code with what follows
+/// it (`rs_value`, `us_value`, `sub_value`, `gs_name`, `soh_key`, `bel_note`,
+/// `etb_payload`). `sub` is C0-DIFF only:
 ///
 /// ```
 /// let buf = c0::Builder::build(|b| {
@@ -134,6 +136,22 @@ impl Builder {
         self.buf.push(US);
         write_value(&mut self.buf, value.as_ref());
         self.units += 1;
+        self
+    }
+
+    /// A bare SUB: a substitution whose new side is empty. C0-DIFF only;
+    /// in a data body SUB is an error. Does not change the unit count.
+    pub fn sub(&mut self) -> &mut Self {
+        self.buf.push(SUB);
+        self
+    }
+
+    /// SUB and the new side of a substitution. C0-DIFF only:
+    /// `rs_value("old").sub_value("new")` is a replace-all,
+    /// `us_value("10").sub_value("20")` a pattern unit with one substitution.
+    pub fn sub_value(&mut self, value: impl AsRef<[u8]>) -> &mut Self {
+        self.buf.push(SUB);
+        write_value(&mut self.buf, value.as_ref());
         self
     }
 

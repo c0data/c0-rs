@@ -505,6 +505,21 @@ fn builder_spells_primitives_as_the_bytes_read() {
         ),
         (
             Builder::build(|b| {
+                b.fs("f")
+                    .rs_value("old")
+                    .sub_value("new")
+                    .gs_name("x")
+                    .us_value("10")
+                    .sub_value("20")
+                    .us_value("a b")
+                    .sub()
+                    .us()
+                    .sub_value(" c");
+            }),
+            "␜f␞old␚new␝x␟10␚20␟a b␚␟␚␂ c␃",
+        ),
+        (
+            Builder::build(|b| {
                 b.rs_value("a\nb")
                     .us_value(" x")
                     .bel_note("n\tn")

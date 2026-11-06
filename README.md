@@ -103,13 +103,14 @@ A positional unit holding a level is read with `Record::level` (any body) or
 ### Primitives
 
 Underneath, the builder has one method per code: `fs`, `gs`, `rs`, `us`,
-`soh`, `dle`, `can`, `bel`, `enq`, `syn`, `eot`, `etb`, `em`. Each writes
+`sub`, `soh`, `dle`, `can`, `bel`, `enq`, `syn`, `eot`, `etb`, `em`. Each writes
 its code and, when given, what follows it, so a chain reads like the bytes,
 and anything the grammar allows can be written. Rust has no optional
 arguments, so a code that may stand bare has two spellings: the bare code
-(`rs()`, `us()`, `gs()`, `soh()`, `bel()`, `etb()`) and the code with what
-follows it (`rs_value`, `us_value`, `gs_name`, `soh_key`, `bel_note`,
-`etb_payload`); a reference is `enq(name)` or `enq_path(&[...])`.
+(`rs()`, `us()`, `sub()`, `gs()`, `soh()`, `bel()`, `etb()`) and the code
+with what follows it (`rs_value`, `us_value`, `sub_value`, `gs_name`,
+`soh_key`, `bel_note`, `etb_payload`); a reference is `enq(name)` or
+`enq_path(&[...])`. `sub` is C0-DIFF only: in a data body SUB is an error.
 
 ```rust
 let buf = c0::Builder::build(|b| {
@@ -121,6 +122,7 @@ let buf = c0::Builder::build(|b| {
     b.bel().gs_name("old");                                            // ␇␝old: a dead group
     b.gs().gs_name("sub").rs().enq("users").us().enq_path(&["users", "1"]);
                                                                        // ␝␝sub␞␅users␟␅␂users␟1␃
+    b.rs_value("old").sub_value("new");                                // ␞old␚new (C0-DIFF replace-all)
 });
 ```
 
