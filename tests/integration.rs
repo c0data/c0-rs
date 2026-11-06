@@ -410,3 +410,189 @@ fn names_reject_control_bytes_and_edge_space() {
     assert!(r.is_err(), "edge space in a name must panic");
     assert!(write_name(&mut Vec::new(), b"ok name").is_ok());
 }
+
+// ---- builder primitives --------------------------------------------------
+
+#[test]
+fn builder_refuses_an_empty_note() {
+    let r = std::panic::catch_unwind(|| {
+        Builder::build(|b| {
+            b.record(&["a"]).note("");
+        })
+    });
+    assert!(r.is_err(), "an empty note must panic");
+    let r = std::panic::catch_unwind(|| {
+        Builder::build(|b| {
+            b.record(&["a"]).bel_note("");
+        })
+    });
+    assert!(r.is_err(), "an empty bel_note must panic");
+}
+
+#[test]
+fn builder_spells_primitives_as_the_bytes_read() {
+    let cases: Vec<(Vec<u8>, &str)> = vec![
+        (
+            Builder::build(|b| {
+                b.fs("inv")
+                    .gs_name("users")
+                    .soh()
+                    .rs_value("name")
+                    .us_value("amount");
+            }),
+            "␜inv␝users␁␞name␟amount",
+        ),
+        (
+            Builder::build(|b| {
+                b.rs_value("Alice").us_value("1502.30");
+            }),
+            "␞Alice␟1502.30",
+        ),
+        (
+            Builder::build(|b| {
+                b.rs()
+                    .soh_key("host")
+                    .us_value("localhost")
+                    .soh_key("port")
+                    .us_value("5432");
+            }),
+            "␞␁host␟localhost␁port␟5432",
+        ),
+        (
+            Builder::build(|b| {
+                b.rs_value("cfg")
+                    .us()
+                    .dle()
+                    .rs()
+                    .soh_key("b")
+                    .us_value("2")
+                    .can();
+            }),
+            "␞cfg␟␐␞␁b␟2␘",
+        ),
+        (
+            Builder::build(|b| {
+                b.bel_note("checked").rs_value("x");
+            }),
+            "␇checked␞x",
+        ),
+        (
+            Builder::build(|b| {
+                b.bel()
+                    .gs_name("old")
+                    .rs_value("1")
+                    .gs_name("new")
+                    .rs_value("2");
+            }),
+            "␇␝old␞1␝new␞2",
+        ),
+        (
+            Builder::build(|b| {
+                b.gs()
+                    .gs_name("sub")
+                    .rs()
+                    .enq("users")
+                    .us()
+                    .enq_path(&["users", "1"]);
+            }),
+            "␝␝sub␞␅users␟␅␂users␟1␃",
+        ),
+        (
+            Builder::build(|b| {
+                b.syn().soh_key("version").us_value("1").rs_value("a").eot();
+            }),
+            "␖␁version␟1␞a␄",
+        ),
+        (
+            Builder::build(|b| {
+                b.rs_value("a\nb")
+                    .us_value(" x")
+                    .bel_note("n\tn")
+                    .etb_payload("p");
+            }),
+            "␞␂a\nb␃␟␂ x␃␇␂n\tn␃␗p",
+        ),
+    ];
+    for (bytes, pretty) in cases {
+        assert_eq!(bytes, parse(pretty), "{pretty}");
+    }
+    let em = Builder::build(|b| {
+        b.rs_value("a").etb().em(b"raw");
+    });
+    assert_eq!(em, b"\x1ea\x17\x19raw");
+}
+
+#[test]
+fn builder_mixes_primitives_with_composed_methods() {
+    let buf = Builder::build(|b| {
+        b.rs_value("a");
+        b.field("b");
+        b.begin_record();
+        b.us_value("c");
+        b.gs_name("g");
+        b.key("k", "v");
+        b.group("h", Some(&["h"]));
+        b.field("x");
+        b.rs();
+        b.list(&["1", "2"]);
+        b.level(|b| {
+            b.rs_value("y");
+            b.reference("g");
+        });
+        b.us();
+        b.dle();
+        b.record(&["z"]);
+        b.can();
+        b.field("w");
+    });
+    assert_eq!(buf, parse("␞a␟b␞␟c␝g␞␁k␟v␝h␁␞h␞x␞␐␞1␟2␘␟␐␞y␟␅g␘␟␐␞z␘␟w"));
+    let r = std::panic::catch_unwind(|| {
+        Builder::build(|b| {
+            b.can();
+        })
+    });
+    assert!(r.is_err(), "CAN with no open level must panic");
+}
+
+#[test]
+fn builder_writes_the_same_bytes_through_either_layer() {
+    let hi = Builder::build(|b| {
+        b.syn().heading("shape", "tabular");
+        b.group("users", Some(&["name", "amount"]));
+        b.record(&["Alice", "1502.30"]);
+        b.record(&["Bob", "3 40"]);
+        b.group("cfg", None);
+        b.map(&[("host", "localhost"), ("port", "5432")]);
+        b.begin_record();
+        b.key_level("origins", |b| {
+            b.record(&["a", "b"]);
+        });
+        b.eot();
+    });
+    let lo = Builder::build(|b| {
+        b.syn().soh_key("shape").us_value("tabular");
+        b.gs_name("users").soh().rs_value("name").us_value("amount");
+        b.rs_value("Alice")
+            .us_value("1502.30")
+            .rs_value("Bob")
+            .us_value("3 40");
+        b.gs_name("cfg")
+            .rs()
+            .soh_key("host")
+            .us_value("localhost")
+            .soh_key("port")
+            .us_value("5432");
+        b.rs()
+            .soh_key("origins")
+            .us()
+            .dle()
+            .rs_value("a")
+            .us_value("b")
+            .can()
+            .eot();
+    });
+    assert_eq!(lo, hi);
+    let doc = Document::new(&lo).unwrap();
+    assert!(canonical(doc.body().raw()));
+    assert!(doc.warnings().is_empty());
+}

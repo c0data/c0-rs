@@ -100,6 +100,35 @@ A positional unit holding a level is read with `Record::level` (any body) or
 `Builder::list`). A reference (`␅tags`, `␅␂tags␟001␃`) is written with
 `reference`/`reference_path` and read with `Record::reference`.
 
+### Primitives
+
+Underneath, the builder has one method per code: `fs`, `gs`, `rs`, `us`,
+`soh`, `dle`, `can`, `bel`, `enq`, `syn`, `eot`, `etb`, `em`. Each writes
+its code and, when given, what follows it, so a chain reads like the bytes,
+and anything the grammar allows can be written. Rust has no optional
+arguments, so a code that may stand bare has two spellings: the bare code
+(`rs()`, `us()`, `gs()`, `soh()`, `bel()`, `etb()`) and the code with what
+follows it (`rs_value`, `us_value`, `gs_name`, `soh_key`, `bel_note`,
+`etb_payload`); a reference is `enq(name)` or `enq_path(&[...])`.
+
+```rust
+let buf = c0::Builder::build(|b| {
+    b.rs_value("Alice").us_value("1502.30");                           // ␞Alice␟1502.30
+    b.rs().soh_key("host").us_value("localhost").soh_key("port").us_value("5432");
+                                                                       // ␞␁host␟localhost␁port␟5432
+    b.gs_name("users").soh().rs_value("name").us_value("amount");      // ␝users␁␞name␟amount
+    b.rs_value("cfg").us().dle().rs().soh_key("b").us_value("2").can(); // ␞cfg␟␐␞␁b␟2␘
+    b.bel().gs_name("old");                                            // ␇␝old: a dead group
+    b.gs().gs_name("sub").rs().enq("users").us().enq_path(&["users", "1"]);
+                                                                       // ␝␝sub␞␅users␟␅␂users␟1␃
+});
+```
+
+The composed methods above are built on these and cannot write ill-formed
+output; with the primitives, well-formedness is yours. The two layers
+share the record state and mix freely: `rs_value("a")` then `field("b")`
+writes `␞a␟b`, and `gs_name("g")` then `key("k", "v")` writes `␝g␞␁k␟v`.
+
 ### Documents
 
 ```rust
