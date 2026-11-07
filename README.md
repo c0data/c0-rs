@@ -45,7 +45,7 @@ The library is dependency-free by default. The optional `json` feature adds
 JSON *text* conversion and pulls in `serde_json`:
 
 ```toml
-c0 = { version = "0.3.0", features = ["json"] }
+c0data = { version = "0.3.1", features = ["json"] }   # used in code as `c0`
 ```
 
 ## Usage
