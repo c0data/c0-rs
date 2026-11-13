@@ -6,7 +6,7 @@ use crate::*;
 ///
 /// ```
 /// let buf = c0::Builder::build(|b| {
-///     b.syn().heading("shape", "tabular");
+///     b.syn().heading("schema", "ledger");
 ///     b.group("users", Some(&["name", "amount"]));
 ///     b.record(&["Alice", "1502.30"]);
 ///     b.record(&["Bob", "340.00"]);
@@ -20,20 +20,27 @@ use crate::*;
 /// writes its code and, when given, what grammatically follows it, so a
 /// chain reads like the bytes. Rust has no optional arguments, so the codes
 /// that may stand bare come in two spellings: the bare code (`rs()`, `us()`,
-/// `sub()`, `gs()`, `soh()`, `bel()`, `etb()`) and the code with what follows
-/// it (`rs_value`, `us_value`, `sub_value`, `gs_name`, `soh_key`, `bel_note`,
-/// `etb_payload`). `sub` is C0-DIFF only:
+/// `gs()`, `soh()`, `bel()`, `etb()`) and the code with what follows it
+/// (`rs_value`, `us_value`, `gs_name`, `soh_key`, `bel_note`,
+/// `etb_payload`). `sub` is always bare: it supersedes the element before
+/// the next separator or opener by the one after (`old␚␟new`). A reference
+/// is `enq(name)` or `enq_level(|b| …)`, a pattern:
 ///
 /// ```
 /// let buf = c0::Builder::build(|b| {
 ///     b.rs_value("Alice").us_value("1502.30");          // ␞Alice␟1502.30
 ///     b.rs().soh_key("host").us_value("localhost");     // ␞␁host␟localhost
 ///     b.bel().gs_name("old");                           // ␇␝old: a dead group
+///     b.rs_value("old").sub().us_value("new");          // ␞old␚␟new: old superseded by new
+///     b.rs().enq("tags").us().enq_level(|b| {           // ␞␅tags␟␅␐␝tags␞001␘
+///         b.gs_name("tags").rs_value("001");
+///     });
 /// });
 /// ```
 ///
 /// The composed methods (`file`, `group`, `header`, `record`, `field`,
-/// `map`, `key`, `level`, `list`, `reference`, `note`, …) are built on the
+/// `map`, `key`, `level`, `list`, `reference`, `supersede`, `note`, …) are
+/// built on the
 /// primitives and cannot write ill-formed output. The primitives write what
 /// you spell; well-formedness is then yours to keep. Both layers share the
 /// record state, so they mix.
@@ -43,7 +50,7 @@ use crate::*;
 /// `AsRef<[u8]>` and are byte-transparent. Keyed records ([`map`], [`key`])
 /// keep the order given. Nested levels ([`level`], [`list`], [`key_level`])
 /// open with DLE and close with CAN. Names (file and group labels, keys,
-/// header names, reference segments, commit payloads) are identifiers: a
+/// header names, pattern steps, commit payloads) are identifiers: a
 /// name with a byte below 0x20 or edge whitespace panics.
 ///
 /// [`map`]: Builder::map
@@ -139,19 +146,11 @@ impl Builder {
         self
     }
 
-    /// A bare SUB: a substitution whose new side is empty. C0-DIFF only;
-    /// in a data body SUB is an error. Does not change the unit count.
+    /// SUB: the element before the next separator or opener is superseded
+    /// by the element after it, at that code's grain (`old␚␟new`, `␚␞`,
+    /// `␚␝`, `␚␜`, `␚␁`). Does not change the unit count.
     pub fn sub(&mut self) -> &mut Self {
         self.buf.push(SUB);
-        self
-    }
-
-    /// SUB and the new side of a substitution. C0-DIFF only:
-    /// `rs_value("old").sub_value("new")` is a replace-all,
-    /// `us_value("10").sub_value("20")` a pattern unit with one substitution.
-    pub fn sub_value(&mut self, value: impl AsRef<[u8]>) -> &mut Self {
-        self.buf.push(SUB);
-        write_value(&mut self.buf, value.as_ref());
         self
     }
 
@@ -210,37 +209,22 @@ impl Builder {
         self
     }
 
-    /// ENQ and a group reference (a name).
+    /// ENQ and a group name: a group reference. The name is required.
     pub fn enq(&mut self, name: &str) -> &mut Self {
+        assert!(!name.is_empty(), "a reference needs a name");
         self.buf.push(ENQ);
         self.name(name);
         self
     }
 
-    /// ENQ and a reference by path: one segment is a group reference, two
-    /// or three are a path written as text.
-    pub fn enq_path(&mut self, segments: &[&str]) -> &mut Self {
-        assert!(
-            (1..=3).contains(&segments.len()),
-            "a reference path has one to three segments"
-        );
-        if segments.len() == 1 {
-            return self.enq(segments[0]);
-        }
+    /// ENQ and a pattern: a level built in `f`, the target with its values
+    /// left out (`enq_level(|b| { b.gs_name("tags").rs_value("001").us_value("label"); })`
+    /// writes `␅␐␝tags␞001␟label␘`).
+    pub fn enq_level<F: FnOnce(&mut Builder)>(&mut self, f: F) -> &mut Self {
         self.buf.push(ENQ);
-        self.buf.push(STX);
-        for (i, seg) in segments.iter().enumerate() {
-            if i > 0 {
-                self.buf.push(US);
-            }
-            assert!(
-                !seg.is_empty() && is_name(seg.as_bytes()),
-                "reference segment is not a name: {seg:?}"
-            );
-            self.buf.extend_from_slice(seg.as_bytes());
-        }
-        self.buf.push(ETX);
-        self
+        self.dle();
+        f(self);
+        self.can()
     }
 
     /// SYN: the start of a document. Heading pairs follow as
@@ -450,11 +434,33 @@ impl Builder {
         self.enq(name)
     }
 
-    /// A reference by path as the next unit: one segment is a group
-    /// reference, two or three are a path written as text.
-    pub fn reference_path(&mut self, segments: &[&str]) -> &mut Self {
+    /// A reference as the next unit, its pattern built in `f` (see
+    /// [`enq_level`]).
+    ///
+    /// [`enq_level`]: Builder::enq_level
+    pub fn reference_level<F: FnOnce(&mut Builder)>(&mut self, f: F) -> &mut Self {
         self.next_unit();
-        self.enq_path(segments)
+        self.enq_level(f)
+    }
+
+    /// A reference to a record, or to a field of it, as the next unit: the
+    /// pattern `␅␐␝group␞record␟field␘`.
+    pub fn reference_to(&mut self, group: &str, record: &str, field: Option<&str>) -> &mut Self {
+        self.next_unit();
+        self.enq_level(|b| {
+            b.gs_name(group).rs_value(record);
+            if let Some(f) = field {
+                b.us_value(f);
+            }
+        })
+    }
+
+    /// A superseded unit: `old` superseded by `new`, written `old␚␟new`.
+    /// The record's result holds `new` alone.
+    pub fn supersede(&mut self, old: impl AsRef<[u8]>, new: impl AsRef<[u8]>) -> &mut Self {
+        self.field(old);
+        self.sub();
+        self.field(new)
     }
 
     // ---- comments ----------------------------------------------------------

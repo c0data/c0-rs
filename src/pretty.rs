@@ -62,6 +62,7 @@ fn format_compact(buf: &[u8], indent: &str, out: &mut Vec<u8>) -> Result<()> {
     let mut depth = 0usize; // nesting depth (levels)
     let mut gdepth = 0usize; // group depth within the current level
     let mut line_start = true;
+    let mut prefixed = false; // a ␚ already opened this line
     let mut stack: Vec<usize> = Vec::new();
 
     while pos < len {
@@ -88,8 +89,11 @@ fn format_compact(buf: &[u8], indent: &str, out: &mut Vec<u8>) -> Result<()> {
                 gdepth = 0;
             }
             FS => {
-                newline_unless(out, line_start);
-                write_indent(out, indent, depth);
+                if !prefixed {
+                    newline_unless(out, line_start);
+                    write_indent(out, indent, depth);
+                }
+                prefixed = false;
                 push_glyph(out, FS);
                 pos = write_plain(buf, pos + 1, len, out)?;
                 out.push(b'\n');
@@ -102,8 +106,11 @@ fn format_compact(buf: &[u8], indent: &str, out: &mut Vec<u8>) -> Result<()> {
                     run += 1;
                     pos += 1;
                 }
-                newline_unless(out, line_start);
-                write_indent(out, indent, depth);
+                if !prefixed {
+                    newline_unless(out, line_start);
+                    write_indent(out, indent, depth);
+                }
+                prefixed = false;
                 for _ in 0..run {
                     push_glyph(out, GS);
                 }
@@ -111,6 +118,25 @@ fn format_compact(buf: &[u8], indent: &str, out: &mut Vec<u8>) -> Result<()> {
                 out.push(b'\n');
                 line_start = true;
                 gdepth = 1;
+            }
+            SUB => {
+                // the mark stands on the line of the element it qualifies
+                let p2 = scan::layout(buf, pos + 1, len);
+                if p2 < len && (buf[p2] == GS || buf[p2] == FS) {
+                    newline_unless(out, line_start);
+                    write_indent(out, indent, depth);
+                    push_glyph(out, SUB);
+                    prefixed = true;
+                    line_start = false;
+                    pos = p2;
+                } else {
+                    newline_unless(out, line_start);
+                    write_indent(out, indent, depth + gdepth);
+                    let (p, d, ls) = write_element(buf, pos, len, out, depth, gdepth, &mut stack)?;
+                    pos = p;
+                    depth = d;
+                    line_start = ls;
+                }
             }
             SOH | RS | BEL | ETB => {
                 newline_unless(out, line_start);
@@ -154,8 +180,8 @@ fn format_compact(buf: &[u8], indent: &str, out: &mut Vec<u8>) -> Result<()> {
                 out.push(b'\n');
                 return Ok(());
             }
-            STX | DLE | ENQ | US | SUB => {
-                // a unit-level code at element level (e.g. a diff pattern): inline
+            STX | DLE | ENQ | US => {
+                // a unit-level code at element level: inline
                 let (p, d, ls) = write_units(buf, pos, len, out, depth, gdepth, &mut stack)?;
                 pos = p;
                 depth = d;
@@ -200,6 +226,16 @@ fn write_element(
                 return Ok((p, d, true));
             }
             // dead element: render it on this line
+            if pos >= len {
+                return Ok((pos, depth, false));
+            }
+            return write_element(buf, pos, len, out, depth, gdepth, stack);
+        }
+        SUB => {
+            // supersession of a record, keyed unit, group or file: the mark
+            // stands with the element it qualifies
+            push_glyph(out, SUB);
+            pos = scan::layout(buf, pos + 1, len);
             if pos >= len {
                 return Ok((pos, depth, false));
             }
@@ -258,9 +294,25 @@ fn write_units(
             write_data(trim(&buf[start..pos]), out)?;
         } else if is_layout(b) {
             pos += 1;
-        } else if b == US || b == ENQ || b == SUB {
+        } else if b == US || b == ENQ {
             push_glyph(out, b);
             pos += 1;
+        } else if b == SUB {
+            // before US or a keyed unit the supersession is inside this
+            // record, on this line; before anything else the mark belongs to
+            // the next element
+            let p2 = scan::layout(buf, pos + 1, len);
+            if !(p2 < len && (buf[p2] == US || buf[p2] == SOH)) {
+                break;
+            }
+            if buf[p2] == SOH {
+                let p3 = scan::layout(buf, p2 + 1, len);
+                if p3 < len && buf[p3] == RS {
+                    break;
+                }
+            }
+            push_glyph(out, SUB);
+            pos = p2;
         } else if b == SOH {
             let p2 = scan::layout(buf, pos + 1, len);
             if p2 < len && buf[p2] == RS {
@@ -339,6 +391,18 @@ fn write_heading(buf: &[u8], mut pos: usize, len: usize, out: &mut Vec<u8>) -> R
             } else {
                 break;
             }
+        } else if b == SUB {
+            // a superseded heading key stays on the heading line
+            let p2 = scan::layout(buf, pos + 1, len);
+            if !(p2 < len && buf[p2] == SOH) {
+                break;
+            }
+            let p3 = scan::layout(buf, p2 + 1, len);
+            if p3 < len && buf[p3] == RS {
+                break;
+            }
+            push_glyph(out, SUB);
+            pos = p2;
         } else if is_layout(b) {
             pos += 1;
         } else {

@@ -4,8 +4,9 @@
 use crate::*;
 use std::borrow::Cow;
 
-/// The heading of a document: keyed units after SYN, in written order.
-/// Lookups take the last value for a duplicate key.
+/// The heading of a document: keyed units after SYN, in written order,
+/// superseded keys dropped. A duplicate key is reported as written;
+/// lookups take the last value.
 pub struct Heading<'a> {
     raw: &'a [u8],
     pairs: Vec<(&'a [u8], Cow<'a, [u8]>)>,
@@ -13,6 +14,18 @@ pub struct Heading<'a> {
 }
 
 impl<'a> Heading<'a> {
+    pub(crate) fn new(
+        raw: &'a [u8],
+        pairs: Vec<(&'a [u8], Cow<'a, [u8]>)>,
+        raw_pairs: Vec<(&'a [u8], &'a [u8])>,
+    ) -> Self {
+        Heading {
+            raw,
+            pairs,
+            raw_pairs,
+        }
+    }
+
     /// The heading of a document without SYN.
     pub fn empty() -> Self {
         Heading {
@@ -62,6 +75,12 @@ impl<'a> Heading<'a> {
             .unwrap_or(1)
     }
 
+    /// The schema the body claims: a name, or the raw level holding the
+    /// keyed record of `name`, `url` and `hash`; `None` when absent.
+    pub fn schema(&self) -> Option<&[u8]> {
+        self.get("schema")
+    }
+
     /// Raw unit of the `blob` key (a level), or `None`.
     pub fn raw_blob(&self) -> Option<&'a [u8]> {
         let mut found = None;
@@ -86,102 +105,8 @@ impl<'a> Heading<'a> {
     }
 }
 
-/// Parse keyed units after SYN. Returns the heading and the position of
-/// the first body code.
-pub(crate) fn parse_heading(
-    buf: &[u8],
-    mut pos: usize,
-    len: usize,
-) -> Result<(Heading<'_>, usize)> {
-    let hs = pos;
-    let mut pairs = Vec::new();
-    let mut raw_pairs = Vec::new();
-    loop {
-        pos = scan::layout(buf, pos, len);
-        if pos >= len {
-            break;
-        }
-        let b = buf[pos];
-        if b == SOH {
-            let p2 = scan::layout(buf, pos + 1, len);
-            if p2 < len && buf[p2] == RS {
-                break; // a header row begins the body
-            }
-            let ks = p2;
-            let ke = scan::plain(buf, ks, len);
-            if !(ke < len && buf[ke] == US) {
-                return Err(Error::syntax("key without a value (no US)", ke));
-            }
-            let vs = ke + 1;
-            let ve = scan::unit(buf, vs, len)?;
-            let key = trim(&buf[ks..ke]);
-            let rawv = trim(&buf[vs..ve]);
-            if rawv.first() == Some(&ENQ) {
-                return Err(Error::syntax("reference in a heading", vs));
-            }
-            raw_pairs.push((key, rawv));
-            let v = if rawv.first() == Some(&DLE) {
-                Cow::Borrowed(rawv)
-            } else {
-                value(rawv)?
-            };
-            pairs.push((key, v));
-            pos = ve;
-        } else if b == BEL {
-            let p2 = scan::layout(buf, pos + 1, len);
-            if p2 >= len {
-                return Err(Error::end("BEL at end of input", p2));
-            }
-            let b2 = buf[p2];
-            let header_row = b2 == SOH && {
-                let p3 = scan::layout(buf, p2 + 1, len);
-                p3 < len && buf[p3] == RS
-            };
-            if b2 >= 0x20 || b2 == STX || (b2 == SOH && !header_row) {
-                pos = scan::comment(buf, pos, len)?; // a note or a dead key
-            } else {
-                break; // a dead body element begins the body
-            }
-        } else if b >= 0x20 {
-            return Err(Error::syntax("plain text directly after SYN", pos));
-        } else {
-            break;
-        }
-    }
-    Ok((
-        Heading {
-            raw: &buf[hs..pos],
-            pairs,
-            raw_pairs,
-        },
-        pos,
-    ))
-}
-
-// From the start of a body to its end: EOT, SYN, EM or end of input at
-// depth zero, skipping text and levels.
-fn find_body_end(buf: &[u8], mut pos: usize, len: usize) -> Result<usize> {
-    while pos < len {
-        let b = buf[pos];
-        if b >= 0x20 {
-            pos += 1;
-        } else if b == STX {
-            pos = scan::text(buf, pos, len)?;
-        } else if b == DLE {
-            pos = scan::level(buf, pos, len)?;
-        } else if b == EOT || b == SYN || b == EM {
-            return Ok(pos);
-        } else if b == CAN {
-            return Err(Error::syntax("CAN with no open level", pos));
-        } else {
-            pos += 1;
-        }
-    }
-    Ok(pos)
-}
-
-const KNOWN_KEYS: [&[u8]; 3] = [b"shape", b"version", b"blob"];
-const KNOWN_SHAPES: [&str; 5] = ["diff", "stream", "tabular", "document", "key-value"];
+const KNOWN_KEYS: [&[u8]; 4] = [b"shape", b"schema", b"version", b"blob"];
+const KNOWN_SHAPES: [&str; 2] = ["diff", "stream"];
 
 /// One C0DATA document: an optional SYN heading, a body, an optional EOT.
 /// [`Document::new`] reads the first document in a buffer; use
@@ -205,34 +130,50 @@ impl<'a> Document<'a> {
 
     /// Read the document starting at `start`.
     pub fn at(buf: &'a [u8], start: usize) -> Result<Self> {
-        let len = buf.len();
+        let mut parser = Parser::new(buf, false);
+        Self::parse(buf, start, buf.len(), &mut parser)
+    }
+
+    /// Read the document in `buf[start..stop]` with the given parser.
+    pub(crate) fn parse(
+        buf: &'a [u8],
+        start: usize,
+        stop: usize,
+        p: &mut Parser<'a>,
+    ) -> Result<Self> {
         let mut warnings = Vec::new();
-        let mut pos = scan::layout(buf, start, len);
-        let has_syn = pos < len && buf[pos] == SYN;
+        let mut pos = p.layout(start, stop);
+        let has_syn = pos < stop && buf[pos] == SYN;
         let heading = if has_syn {
-            let (h, p) = parse_heading(buf, pos + 1, len)?;
-            pos = p;
+            p.not_canonical("SYN in a canonical span");
+            let (h, after) = p.heading(pos + 1, stop)?;
+            pos = after;
             h
         } else {
             warnings.push("no SYN at the start of the document".to_string());
             Heading::empty()
         };
         let body_start = pos;
-        let body_end = find_body_end(buf, pos, len)?;
-        let body = Body::slice(buf, body_start, body_end)?;
-        pos = scan::layout(buf, body_end, len);
-        let has_eot = pos < len && buf[pos] == EOT;
+        let (files, body_end) = p.body(pos, stop, false)?;
+        let body = Body::from_parts(buf, body_start, body_end, files);
+        pos = p.layout(body_end, stop);
+        let has_eot = pos < stop && buf[pos] == EOT;
         if has_eot {
+            p.not_canonical("EOT in a canonical span");
             pos += 1;
         } else if heading.shape() != Some("stream") {
             warnings.push("no EOT at the end of the document".to_string());
         }
+        let mut seen: Vec<&[u8]> = Vec::new();
         for k in heading.keys() {
+            let name = String::from_utf8_lossy(k);
             if !KNOWN_KEYS.contains(&k) {
-                warnings.push(format!(
-                    "unknown heading key '{}'",
-                    String::from_utf8_lossy(k)
-                ));
+                warnings.push(format!("unknown heading key '{name}'"));
+            }
+            if seen.contains(&k) {
+                warnings.push(format!("duplicate heading key '{name}': last wins"));
+            } else {
+                seen.push(k);
             }
         }
         if let Some(shape) = heading.get("shape") {
@@ -242,6 +183,11 @@ impl<'a> Document<'a> {
                     "unknown shape '{}'",
                     String::from_utf8_lossy(shape)
                 ));
+            }
+        }
+        if let Some(v) = heading.get("version") {
+            if v != b"1" {
+                warnings.push(format!("unknown version '{}'", String::from_utf8_lossy(v)));
             }
         }
         Ok(Document {
@@ -282,7 +228,7 @@ impl<'a> Document<'a> {
         self.has_eot
     }
 
-    /// Loud and ordinary warnings met while reading; never an error.
+    /// Loud warnings met while reading (DESIGN.md, Warnings); never an error.
     pub fn warnings(&self) -> &[String] {
         &self.warnings
     }
@@ -342,29 +288,66 @@ pub struct Container<'a> {
 
 impl<'a> Container<'a> {
     pub fn new(buf: &'a [u8]) -> Result<Self> {
-        let len = buf.len();
+        let mut parser = Parser::new(buf, false);
+        Self::parse(buf, buf.len(), &mut parser)
+    }
+
+    /// Parse `buf[..stop]` with the given parser. The tail after EM runs to
+    /// the end of the buffer.
+    pub(crate) fn parse(buf: &'a [u8], stop: usize, p: &mut Parser<'a>) -> Result<Self> {
         let mut documents: Vec<Document<'a>> = Vec::new();
         let mut tail: &'a [u8] = &[];
         let mut has_em = false;
         let mut warnings = Vec::new();
-        let mut pos = scan::layout(buf, 0, len);
-        while pos < len {
+        let mut pos = p.layout(0, stop);
+        let mut first = true;
+        while pos < stop {
             if buf[pos] == EM {
+                p.not_canonical("EM in a canonical span");
                 has_em = true;
                 tail = &buf[pos + 1..];
                 break;
             }
-            let doc = Document::at(buf, pos)?;
-            pos = scan::layout(buf, doc.stop, len);
-            if !documents.is_empty() && doc.heading.raw_blob().is_some() {
-                warnings.push(format!(
-                    "blob table in heading of document {} ignored",
-                    documents.len() + 1
+            if !first && buf[pos] != SYN {
+                return Err(Error::syntax(
+                    "a document after the first must begin with SYN",
+                    pos,
                 ));
             }
+            let doc = Document::parse(buf, pos, stop, p)?;
+            first = false;
+            pos = p.layout(doc.stop, stop);
+            let has_eot = doc.has_eot;
             documents.push(doc);
-            if pos < len && buf[pos] != SYN && buf[pos] != EM {
-                return Err(Error::syntax("unexpected byte after EOT", pos));
+            if pos < stop && buf[pos] != SYN && buf[pos] != EM {
+                return Err(Error::syntax(
+                    if has_eot {
+                        "unexpected byte after EOT"
+                    } else {
+                        "unexpected byte after document"
+                    },
+                    pos,
+                ));
+            }
+        }
+        for (i, doc) in documents.iter().enumerate() {
+            let Some(raw) = doc.heading.raw_blob() else {
+                continue;
+            };
+            if i > 0 {
+                warnings.push("blob table in a later heading is ignored".to_string());
+            } else if !is_level(raw) {
+                warnings.push("blob is not a level: declares nothing".to_string());
+            } else {
+                let has_header = doc
+                    .heading
+                    .blob()
+                    .ok()
+                    .flatten()
+                    .is_some_and(|b| b.groups().next().is_some_and(|g| g.has_header()));
+                if !has_header {
+                    warnings.push("blob table has no header row: declares nothing".to_string());
+                }
             }
         }
         if has_em
@@ -402,7 +385,7 @@ impl<'a> Container<'a> {
     }
 
     /// Container-level loud warnings (a `blob` key in a later heading, EM
-    /// with no blob table).
+    /// with no blob table); each document carries its own.
     pub fn warnings(&self) -> &[String] {
         &self.warnings
     }

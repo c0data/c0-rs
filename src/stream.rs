@@ -1,8 +1,12 @@
 //! Stream mode: ETB-committed append logs (DESIGN.md "Stream Mode").
 //!
-//! An unescaped ETB is always a commit, inside open text or a level too:
-//! such a block is damaged and yields nothing. The tail after the last
-//! commit is torn unless it holds only layout, notes or EOT.
+//! An unescaped ETB is always a commit, inside open text or a level too. A
+//! committed block that is not well-formed, cut by its ETB or holding any
+//! other error, is damaged: nothing in it is delivered, and by default the
+//! reader delivers the records before it and then fails with
+//! [`Error::DamagedBlock`] naming the offset to resume at; a reader made
+//! with [`StreamReader::continuing`] reads on past the block. The tail
+//! after the last commit is torn unless it holds only layout, notes or EOT.
 //!
 //! ```no_run
 //! let mut log = c0::open_log("events.c0")?;        // repairs a torn tail first
@@ -16,30 +20,49 @@
 
 use crate::*;
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::Path;
 
 /// Scans a buffer for commits and exposes the committed region, block by
-/// block. Zero-copy: accessors return slices into the original buffer.
+/// block, and its records. Zero-copy: accessors return slices into the
+/// original buffer.
 pub struct StreamReader<'a> {
     buf: &'a [u8],
     committed_end: usize,
     blocks: Vec<(usize, usize)>,
     damaged: Vec<usize>,
     torn: bool,
+    continue_past_damage: bool,
+    // The committed region parsed with damaged blocks skipped; an error
+    // only when one lies outside every block.
+    container: Result<Container<'a>>,
 }
 
 impl<'a> StreamReader<'a> {
+    /// A reader that stops at the first damaged block.
     pub fn new(buf: &'a [u8]) -> Self {
+        Self::with_options(buf, false)
+    }
+
+    /// A reader that skips damaged blocks and reads on.
+    pub fn continuing(buf: &'a [u8]) -> Self {
+        Self::with_options(buf, true)
+    }
+
+    fn with_options(buf: &'a [u8], continue_past_damage: bool) -> Self {
         let mut r = StreamReader {
             buf,
             committed_end: 0,
             blocks: Vec::new(),
             damaged: Vec::new(),
             torn: false,
+            continue_past_damage,
+            container: Err(Error::other("unparsed")),
         };
         r.scan();
+        r.container = r.parse_committed();
         r
     }
 
@@ -68,6 +91,11 @@ impl<'a> StreamReader<'a> {
         self.torn
     }
 
+    /// Whether the reader goes on past a damaged block.
+    pub fn continue_past_damage(&self) -> bool {
+        self.continue_past_damage
+    }
+
     pub fn block_count(&self) -> usize {
         self.blocks.len()
     }
@@ -88,7 +116,14 @@ impl<'a> StreamReader<'a> {
         (0..self.blocks.len()).map(move |i| self.block(i))
     }
 
-    /// Indexes of blocks cut by an ETB inside open text or a level.
+    /// Offset after a block's ETB and payload: the start of the next block.
+    pub fn block_end(&self, i: usize) -> usize {
+        self.blocks
+            .get(i + 1)
+            .map_or(self.committed_end, |&(s, _)| s)
+    }
+
+    /// Indexes of committed blocks that are not well-formed.
     pub fn damaged(&self) -> &[usize] {
         &self.damaged
     }
@@ -98,8 +133,7 @@ impl<'a> StreamReader<'a> {
     }
 
     /// The committed region with damaged blocks removed: borrowed when no
-    /// block is damaged, otherwise the undamaged blocks concatenated.
-    /// Read it with [`Document::new`] or [`Body::new`].
+    /// block is damaged, otherwise the sound blocks concatenated.
     pub fn undamaged(&self) -> Cow<'a, [u8]> {
         if self.damaged.is_empty() {
             return Cow::Borrowed(self.committed());
@@ -113,18 +147,105 @@ impl<'a> StreamReader<'a> {
         Cow::Owned(out)
     }
 
-    /// Logical values of every committed record (headings and header rows
-    /// excluded), undamaged blocks only.
-    pub fn records(&self) -> Result<Vec<Vec<Vec<u8>>>> {
-        let bytes = self.undamaged();
-        let doc = Document::new(&bytes)?;
-        let mut out = Vec::new();
-        for g in doc.groups() {
-            for r in g.records() {
-                out.push(r.values()?.into_iter().map(|v| v.into_owned()).collect());
+    /// The committed region as documents, damaged blocks left out. Fails
+    /// with [`Error::DamagedBlock`] when a block is damaged, unless the
+    /// reader continues past damage.
+    pub fn container(&self) -> Result<&Container<'a>> {
+        self.check_damage()?;
+        self.container.as_ref().map_err(Clone::clone)
+    }
+
+    /// The first document of the committed region.
+    pub fn document(&self) -> Result<&Document<'a>> {
+        self.container()?
+            .first()
+            .ok_or_else(|| Error::other("the committed region holds no document"))
+    }
+
+    /// Every committed record in order, up to the first damaged block; then
+    /// [`Error::DamagedBlock`], unless continuing, in which case every
+    /// record of every sound block.
+    pub fn each_record<F: FnMut(&Record<'a>)>(&self, mut f: F) -> Result<()> {
+        let c = self.container.as_ref().map_err(Clone::clone)?;
+        let limit = if self.continue_past_damage {
+            usize::MAX
+        } else {
+            self.damaged
+                .first()
+                .map_or(usize::MAX, |&d| self.blocks[d].0)
+        };
+        for doc in c.documents() {
+            for g in doc.body().groups() {
+                for r in g.records() {
+                    if r.offset() >= limit {
+                        self.check_damage()?;
+                    }
+                    f(r);
+                }
             }
         }
-        Ok(out)
+        self.check_damage()
+    }
+
+    /// Logical values of every committed record (headings and header rows
+    /// excluded); see [`StreamReader::each_record`].
+    pub fn records(&self) -> Result<Vec<Vec<Vec<u8>>>> {
+        let mut out = Vec::new();
+        let mut err = None;
+        self.each_record(|r| match r.values() {
+            Ok(vs) => out.push(vs.into_iter().map(|v| v.into_owned()).collect()),
+            Err(e) => err = Some(e),
+        })?;
+        match err {
+            Some(e) => Err(e),
+            None => Ok(out),
+        }
+    }
+
+    fn check_damage(&self) -> Result<()> {
+        if self.continue_past_damage {
+            return Ok(());
+        }
+        match self.damaged.first() {
+            Some(&d) => Err(Error::DamagedBlock {
+                index: d,
+                resume_offset: self.block_end(d),
+            }),
+            None => Ok(()),
+        }
+    }
+
+    // Parse the committed region. Any error inside a committed block marks
+    // that block damaged; the region is then parsed again with the block
+    // skipped, so what follows is read in the context before it.
+    fn parse_committed(&mut self) -> Result<Container<'a>> {
+        let mut skip: HashMap<usize, usize> = HashMap::new();
+        let container = loop {
+            let mut parser = Parser::with_skip(self.buf, skip.clone());
+            match Container::parse(self.buf, self.committed_end, &mut parser) {
+                Ok(c) => break c,
+                Err(e) => {
+                    let Some(pos) = e.position() else {
+                        return Err(e);
+                    };
+                    let Some(i) = self.block_at(pos) else {
+                        return Err(e);
+                    };
+                    if skip.contains_key(&self.blocks[i].0) {
+                        return Err(e);
+                    }
+                    self.damaged.push(i);
+                    skip.insert(self.blocks[i].0, self.block_end(i));
+                }
+            }
+        };
+        self.damaged.sort_unstable();
+        Ok(container)
+    }
+
+    // The block holding byte `pos` of the committed region.
+    fn block_at(&self, pos: usize) -> Option<usize> {
+        self.blocks.iter().rposition(|&(s, _)| s <= pos)
     }
 
     fn scan(&mut self) {
@@ -133,7 +254,6 @@ impl<'a> StreamReader<'a> {
         let mut pos = 0;
         let mut block_start = 0;
         let mut in_text = false;
-        let mut depth = 0usize;
         while pos < len {
             let b = buf[pos];
             if in_text {
@@ -143,16 +263,14 @@ impl<'a> StreamReader<'a> {
                 } else if b == ETX {
                     in_text = false;
                 } else if b == ETB {
-                    self.commit(block_start, pos, true);
+                    self.blocks.push((block_start, pos));
                     pos = self.payload_end(pos + 1);
                     block_start = pos;
                     in_text = false;
-                    depth = 0;
                     continue;
                 } else if b == SYN || b == EOT || b == EM {
-                    // framing cuts the text; the block is torn or damaged
+                    // framing cuts the text
                     in_text = false;
-                    depth = 0;
                     if b == SYN {
                         block_start = pos;
                     }
@@ -161,32 +279,19 @@ impl<'a> StreamReader<'a> {
             } else {
                 if b == STX {
                     in_text = true;
-                } else if b == DLE {
-                    depth += 1;
-                } else if b == CAN {
-                    depth = depth.saturating_sub(1);
                 } else if b == ETB {
-                    self.commit(block_start, pos, depth > 0);
+                    self.blocks.push((block_start, pos));
                     pos = self.payload_end(pos + 1);
                     block_start = pos;
-                    depth = 0;
                     continue;
                 } else if b == SYN && pos > 0 {
                     // tears the uncommitted bytes before it; a new document begins
                     block_start = pos;
-                    depth = 0;
                 }
                 pos += 1;
             }
         }
         self.torn = self.torn_tail();
-    }
-
-    fn commit(&mut self, start: usize, stop: usize, damaged: bool) {
-        self.blocks.push((start, stop));
-        if damaged {
-            self.damaged.push(self.blocks.len() - 1);
-        }
     }
 
     // After an ETB: skip its payload and return committed_end (which

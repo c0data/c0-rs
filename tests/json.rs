@@ -64,7 +64,7 @@ fn to_value_levels_and_references() {
         b.begin_record();
         b.field("Post");
         b.list(&["x", "y"]);
-        b.reference_path(&["tags", "001"]);
+        b.reference_to("tags", "001", None);
         b.level(|b| {
             b.map(&[("k", "v")]);
         });

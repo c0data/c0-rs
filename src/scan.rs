@@ -169,6 +169,20 @@ pub fn record_end(buf: &[u8], mut pos: usize, stop: usize) -> Result<usize> {
         let byte = buf[pos];
         if byte >= 0x20 || is_layout(byte) || byte == US || byte == ENQ {
             pos += 1;
+        } else if byte == SUB {
+            // supersession of a unit or keyed unit stays inside the record;
+            // of a record, group or file, it ends this record first
+            let p2 = layout(buf, pos + 1, stop);
+            if !(p2 < stop && (buf[p2] == US || buf[p2] == SOH)) {
+                return Ok(pos);
+            }
+            if buf[p2] == SOH {
+                let p3 = layout(buf, p2 + 1, stop);
+                if p3 < stop && buf[p3] == RS {
+                    return Ok(pos);
+                }
+            }
+            pos = p2;
         } else if byte == SOH {
             // a header row (SOH RS) ends the record; a keyed unit is inside it
             let p2 = layout(buf, pos + 1, stop);

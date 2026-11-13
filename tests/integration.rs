@@ -167,39 +167,165 @@ fn nested_levels_and_lists() {
 #[test]
 fn references() {
     let buf = Builder::build(|b| {
-        b.group("articles", Some(&["title", "tags", "primary"]));
+        b.group("articles", Some(&["title", "tags", "primary", "sub"]));
         b.begin_record();
         b.field("My Post");
         b.reference("tags");
-        b.reference_path(&["tags", "001", "label"]);
+        b.reference_to("tags", "001", Some("label"));
+        b.reference_level(|b| {
+            b.gs_name("docs").gs().gs_name("intro").rs_value("3");
+        });
     });
     assert!(canonical(&buf));
+    assert!(buf.ends_with(&parse("␅␐␝tags␞001␟label␘␟␅␐␝docs␝␝intro␞3␘")));
     let rec = Body::new(&buf).unwrap().group(0).record(0);
     let r = rec.reference(1).unwrap();
     assert!(r.is_group());
-    assert_eq!(r.group(), b"tags");
+    assert_eq!(r.name(), Some(b"tags".as_ref()));
+    assert_eq!(r.group_name(), Some(b"tags".as_ref()));
     let r = rec.reference(2).unwrap();
-    assert_eq!(r.group(), b"tags");
-    assert_eq!(r.record(), Some(b"001".as_ref()));
-    assert_eq!(r.field(), Some(b"label".as_ref()));
+    assert!(!r.is_group());
+    assert!(r.name().is_none());
+    assert_eq!(r.path(), [b"tags".as_ref(), b"001", b"label"]);
+    let pattern = r.pattern().unwrap();
+    assert_eq!(pattern.groups().count(), 1);
+    assert_eq!(
+        rec.reference(3).unwrap().path(),
+        [b"docs".as_ref(), b"intro", b"3"]
+    );
     assert!(rec.value(1).is_err());
-    assert!(Reference::parse(b"\x05\x02a\x1f\x1fb\x03").is_err());
-    assert!(Reference::parse(b"\x05\x02a\x1fb\x1fc\x1fd\x03").is_err());
+    // A bare group written as a pattern names the group; text is an error.
+    let b1 = parse("␅␐␝tags␘");
+    let r = Reference::parse(&b1).unwrap();
+    assert!(r.is_group() && r.name().is_none());
+    assert_eq!(r.group_name(), Some(b"tags".as_ref()));
+    assert!(!canonical(&parse("␞␅␐␝tags␘")));
+    assert!(Reference::parse(&parse("␅␂tags␟001␃")).is_err());
+    assert!(Reference::parse(&parse("␅␐␝a␞␂ b␃␘")).is_err());
+    assert!(Reference::parse(&parse("␅␐␝a␞1␝b␘")).is_err());
+    let r = std::panic::catch_unwind(|| {
+        Builder::build(|b| {
+            b.rs().enq("");
+        })
+    });
+    assert!(r.is_err(), "an empty reference name must panic");
+}
+
+#[test]
+fn supersession_drops_the_superseded_element_and_keeps_the_bytes() {
+    let b2 = parse("␝g␞a␟b␚␟c␚␞x␟y");
+    let doc = Document::new(&b2).unwrap();
+    let g = doc.group_by_name("g").unwrap();
+    assert_eq!(g.record_count(), 1);
+    assert_eq!(g.record(0).values().unwrap(), [b"x".as_ref(), b"y"]);
+    let bb = parse("␞a␚␟b␟c");
+    let rec = Body::new(&bb).unwrap().record(0);
+    assert_eq!(rec.values().unwrap(), [b"b".as_ref(), b"c"]);
+    let units: Vec<(Vec<u8>, bool)> = rec
+        .units()
+        .iter()
+        .map(|u| (u.value().unwrap().into_owned(), u.superseded()))
+        .collect();
+    assert_eq!(
+        units,
+        [
+            (b"a".to_vec(), true),
+            (b"b".to_vec(), false),
+            (b"c".to_vec(), false)
+        ]
+    );
+    // every grain: keyed unit, group, file, heading key
+    let bb = parse("␞␁k␟v␚␁k␟w␁j␟1");
+    let rec = Body::new(&bb).unwrap().record(0);
+    assert_eq!(rec.keys(), [b"k".as_ref(), b"j"]);
+    assert_eq!(rec.get("k").unwrap().unwrap().as_ref(), b"w");
+    let b3 = parse("␜f␝g␞x␝␝s␞1␚␝g␞y␚␜f␝h␞z");
+    let doc = Document::new(&b3).unwrap();
+    assert_eq!(doc.files().len(), 1);
+    assert_eq!(doc.group_names(), [b"h".as_ref()]);
+    let b4 = parse("␖␁schema␟a␚␁schema␟b␞x");
+    let doc = Document::new(&b4).unwrap();
+    assert_eq!(doc.heading().schema(), Some(b"b".as_ref()));
+    assert!(doc.warnings().iter().all(|w| !w.contains("duplicate")));
+    // supersession is content: canonical, and kept by the builder
+    assert!(canonical(&parse("␞a␚␟b")));
+    let built = Builder::build(|b| {
+        b.begin_record().supersede("a", "b").field("c");
+    });
+    assert_eq!(built, parse("␞a␚␟b␟c"));
+    // nothing to supersede, or SUB before the wrong byte
+    for bad in [
+        "␝g␚␞x",
+        "␚␝g␞x",
+        "␚␜f␞x",
+        "␞␚␁k␟v",
+        "␞a␚b",
+        "␞a␚",
+        "␞a␟b␚␇␞c",
+        "␞a␇␚␟b",
+    ] {
+        assert!(validate(&parse(bad)).is_err(), "{bad} must be rejected");
+    }
+}
+
+#[test]
+fn dead_elements_take_their_contents() {
+    let b5 = parse("␝g1␞1␇␝g2␁␞x␞2␝␝s␞3␝g3␞4");
+    let doc = Document::new(&b5).unwrap();
+    assert_eq!(doc.group_names(), [b"g1".as_ref(), b"g3"]);
+    let b6 = parse("␜a␝x␞1␇␜b␞2␜c␝y␞3");
+    let doc = Document::new(&b6).unwrap();
+    assert_eq!(doc.files().len(), 2);
+    assert_eq!(doc.files()[1].name(), b"c");
+    // a body whose every element is dead is an empty body: one empty
+    // leading file, no groups
+    for all_dead in ["␇␜b␞2", "␇␜b␞2␇␜c␞3"] {
+        let bytes = parse(all_dead);
+        let body = Body::new(&bytes).unwrap();
+        assert_eq!(body.files().len(), 1, "{all_dead}");
+        assert!(body.files()[0].is_leading());
+        assert_eq!(body.name(), b"");
+        assert_eq!(body.groups().count(), 0);
+        assert_eq!(body.group_count(), 0);
+        assert!(body.records().is_empty());
+        assert!(body.bare());
+        let doc = Document::new(&bytes).unwrap();
+        assert_eq!(doc.name(), b"");
+        assert_eq!(doc.files().len(), 1);
+    }
+    // a header row anywhere but first is an error, live or dead
+    assert!(validate(&parse("␝g␞1␁␞x␞2")).is_err());
+    assert!(validate(&parse("␝g␞1␇␁␞x␞2")).is_err());
+    assert!(validate(&parse("␝g␇␁␞x␟y␁␞p␟q␞1␟2")).is_ok());
 }
 
 #[test]
 fn documents_headings_and_warnings() {
     let buf = Builder::build(|b| {
-        b.syn().heading("shape", "tabular").heading("version", "1");
+        b.syn().heading("schema", "ledger").heading("version", "1");
         b.group("g", None);
         b.record(&["a"]);
         b.eot();
     });
     let doc = Document::new(&buf).unwrap();
     assert!(doc.has_syn() && doc.has_eot());
-    assert_eq!(doc.shape(), Some("tabular"));
+    assert_eq!(doc.shape(), None);
+    assert_eq!(doc.heading().schema(), Some(b"ledger".as_ref()));
     assert_eq!(doc.heading().version(), 1);
     assert!(doc.warnings().is_empty());
+
+    // Shape hints are gone: anything but diff or stream is a loud warning.
+    let b7 = parse("␖␁shape␟tabular␞a␄");
+    let doc = Document::new(&b7).unwrap();
+    assert!(doc.warnings().iter().any(|w| w.contains("unknown shape")));
+    // A duplicate key: last wins, loudly.
+    let b8 = parse("␖␁schema␟a␁schema␟b␞x␄");
+    let doc = Document::new(&b8).unwrap();
+    assert_eq!(doc.heading().schema(), Some(b"b".as_ref()));
+    assert!(doc.warnings().iter().any(|w| w.contains("duplicate")));
+    // The schema key's form is checked.
+    assert!(validate(&parse("␖␁schema␟␐␞␁name␟a␁version␟1␘␞x")).is_err());
+    assert!(validate(&parse("␖␁schema␟␐␞␁url␟u␁hash␟sha256:00␘␞x")).is_ok());
 
     // A slice without SYN or EOT reads with loud warnings, never an error.
     let doc = Document::new(b"\x1dg\x1ea").unwrap();
@@ -304,6 +430,23 @@ fn pretty_roundtrip() {
 }
 
 #[test]
+fn pretty_keeps_supersession_with_its_element() {
+    // unit and keyed-unit grain inline; record, group, file and heading
+    // grain as a prefix on the element's line
+    let cases = [
+        "␖␁schema␟a␚␁schema␟b\n␜f\n␝g\n  ␞a␟b␚␟c\n  ␞␁k␟v␚␁k␟w\n  ␚␞x\n␚␝g\n  ␞y\n␚␜f\n␝h\n  ␞z\n␄\n",
+        "␞a␟␐\n  ␞1␚␟2\n  ␚␞3\n␘\n",
+    ];
+    for want in cases {
+        let bytes = parse(want);
+        validate(&bytes).unwrap();
+        let pretty = format(&bytes).unwrap();
+        assert_eq!(pretty, want);
+        assert_eq!(parse(&pretty), bytes, "{want} must round-trip");
+    }
+}
+
+#[test]
 fn pretty_renders_etb_and_refuses_glyphs() {
     let bytes = b"\x1ecreate\x1fa1b2\x17";
     let pretty = format(bytes).unwrap();
@@ -323,11 +466,38 @@ fn stream_reader_torn_tail_and_damage() {
         r.records().unwrap(),
         vec![vec![b"create".to_vec(), b"a1b2".to_vec()]]
     );
-    // An ETB inside open text is still a commit; the block is damaged.
+    // An ETB inside open text is still a commit; the block is damaged. By
+    // default the reader stops there with the offset to resume at.
     let r = StreamReader::new(b"\x1e\x02a\x17\x1eb\x17");
     assert_eq!(r.damaged(), &[0]);
     assert_eq!(r.undamaged().as_ref(), b"\x1eb");
+    assert_eq!(
+        r.records(),
+        Err(Error::DamagedBlock {
+            index: 0,
+            resume_offset: 4
+        })
+    );
+    let r = StreamReader::continuing(b"\x1e\x02a\x17\x1eb\x17");
     assert_eq!(r.records().unwrap(), vec![vec![b"b".to_vec()]]);
+    // Any error damages the block; records before it are delivered first.
+    let bytes = parse("␞a␗␞b␟␇␅tags␗␞c␗");
+    let r = StreamReader::new(&bytes);
+    assert_eq!(r.damaged(), &[1]);
+    let mut seen = Vec::new();
+    let err = r.each_record(|rec| seen.push(rec.value(0).unwrap().into_owned()));
+    assert_eq!(seen, vec![b"a".to_vec()]);
+    assert!(matches!(
+        err,
+        Err(Error::DamagedBlock {
+            index: 1,
+            resume_offset: 13
+        })
+    ));
+    assert_eq!(
+        StreamReader::continuing(&bytes).records().unwrap(),
+        vec![vec![b"a".to_vec()], vec![b"c".to_vec()]]
+    );
     assert_eq!(last_commit_end(b"\x1ea\x17\x1eb\x17tag\x1ec"), 9);
 }
 
@@ -488,14 +658,11 @@ fn builder_spells_primitives_as_the_bytes_read() {
         ),
         (
             Builder::build(|b| {
-                b.gs()
-                    .gs_name("sub")
-                    .rs()
-                    .enq("users")
-                    .us()
-                    .enq_path(&["users", "1"]);
+                b.gs().gs_name("sub").rs().enq("users").us().enq_level(|b| {
+                    b.gs_name("users").rs_value("1");
+                });
             }),
-            "␝␝sub␞␅users␟␅␂users␟1␃",
+            "␝␝sub␞␅users␟␅␐␝users␞1␘",
         ),
         (
             Builder::build(|b| {
@@ -507,16 +674,19 @@ fn builder_spells_primitives_as_the_bytes_read() {
             Builder::build(|b| {
                 b.fs("f")
                     .rs_value("old")
-                    .sub_value("new")
+                    .sub()
+                    .rs_value("new")
                     .gs_name("x")
-                    .us_value("10")
-                    .sub_value("20")
+                    .rs_value("10")
+                    .sub()
+                    .us_value("20")
                     .us_value("a b")
                     .sub()
                     .us()
-                    .sub_value(" c");
+                    .sub()
+                    .us_value(" c");
             }),
-            "␜f␞old␚new␝x␟10␚20␟a b␚␟␚␂ c␃",
+            "␜f␞old␚␞new␝x␞10␚␟20␟a b␚␟␚␟␂ c␃",
         ),
         (
             Builder::build(|b| {
@@ -572,7 +742,7 @@ fn builder_mixes_primitives_with_composed_methods() {
 #[test]
 fn builder_writes_the_same_bytes_through_either_layer() {
     let hi = Builder::build(|b| {
-        b.syn().heading("shape", "tabular");
+        b.syn().heading("schema", "ledger");
         b.group("users", Some(&["name", "amount"]));
         b.record(&["Alice", "1502.30"]);
         b.record(&["Bob", "3 40"]);
@@ -585,7 +755,7 @@ fn builder_writes_the_same_bytes_through_either_layer() {
         b.eot();
     });
     let lo = Builder::build(|b| {
-        b.syn().soh_key("shape").us_value("tabular");
+        b.syn().soh_key("schema").us_value("ledger");
         b.gs_name("users").soh().rs_value("name").us_value("amount");
         b.rs_value("Alice")
             .us_value("1502.30")

@@ -6,7 +6,8 @@
 //! and hand back slices into it, [`Builder`] writes canonical compact form,
 //! [`validate`] and [`canonical`] check well-formedness and canonicality,
 //! and the `stream`, `pretty`, `diff`, `csv` and `json` modules cover the
-//! rest of the spec.
+//! rest of the spec. One [`Parser`] implements GRAMMAR.md; everything
+//! else sits on it.
 //!
 //! ```
 //! let buf = c0::Builder::build(|b| {
@@ -27,6 +28,7 @@ use std::fmt;
 mod body;
 mod builder;
 mod document;
+mod parser;
 mod pretty;
 mod stream;
 mod validator;
@@ -36,9 +38,10 @@ pub mod diff;
 pub mod json;
 pub mod scan;
 
-pub use body::{Body, FileView, Group, Pair, Record, Reference, Table};
+pub use body::{Body, FileView, Group, Pair, Record, Reference, Table, Unit};
 pub use builder::Builder;
 pub use document::{Container, Document, Heading};
+pub use parser::Parser;
 pub use pretty::{align, format, format_mode, format_with, glyph, parse, FormatMode};
 pub use stream::{
     last_commit_end, open_log, open_log_with, read_log, repair_log, FileLog, StreamReader,
@@ -61,7 +64,7 @@ pub const SYN: u8 = 0x16; // Start of document, then the heading
 pub const ETB: u8 = 0x17; // Commit marker (stream mode)
 pub const CAN: u8 = 0x18; // Close a nested level
 pub const EM: u8 = 0x19; // End of medium: raw blob follows
-pub const SUB: u8 = 0x1a; // Substitution (C0-DIFF)
+pub const SUB: u8 = 0x1a; // Supersede: the element before the next separator or opener is replaced by the one after
 pub const FS: u8 = 0x1c; // File separator
 pub const GS: u8 = 0x1d; // Group separator
 pub const RS: u8 = 0x1e; // Record separator
@@ -109,6 +112,10 @@ pub enum Error {
     UnassignedCode { byte: u8, position: usize },
     /// The input ended inside a construct.
     UnexpectedEnd { what: String, position: usize },
+    /// A committed stream block that is not well-formed (DESIGN.md, Damaged
+    /// Blocks). `resume_offset` is where reading can go on, after the
+    /// block's ETB and payload.
+    DamagedBlock { index: usize, resume_offset: usize },
     /// No group or key by that name.
     Key(String),
     /// A value holds a Control Picture character and cannot be shown in
@@ -159,6 +166,13 @@ impl fmt::Display for Error {
             Error::UnexpectedEnd { what, position } => {
                 write!(f, "Unexpected end of input: {what} at byte {position}")
             }
+            Error::DamagedBlock {
+                index,
+                resume_offset,
+            } => write!(
+                f,
+                "block {index} is damaged; reading can resume at byte {resume_offset}"
+            ),
             Error::Key(what) => write!(f, "{what}"),
             Error::GlyphInData => write!(
                 f,

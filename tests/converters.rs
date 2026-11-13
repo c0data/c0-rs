@@ -42,7 +42,7 @@ fn csv_to_roundtrip_and_references() {
         b.begin_record();
         b.field("Alice");
         b.field("x,y");
-        b.reference_path(&["tags", "001"]);
+        b.reference_to("tags", "001", None);
         b.record(&["Bob", "200", ""]);
     });
     assert_eq!(
@@ -58,7 +58,7 @@ fn csv_to_roundtrip_and_references() {
     assert!(csv::to_csv(&nested).is_err());
 }
 
-// ---- C0-DIFF ----
+// ---- C0DIFF ----
 
 #[test]
 fn diff_parse_simple() {
@@ -69,51 +69,55 @@ fn diff_parse_simple() {
         b.eot();
     });
     assert_eq!(&buf[..12], b"\x16\x01shape\x1fdiff");
+    assert_eq!(
+        buf,
+        parse("␖␁shape␟diff␜foo.txt␞␂Hello ␃␟world␚␟universe␟!␄")
+    );
     let edits = diff::parse(&buf).unwrap();
     assert_eq!(edits.len(), 1);
     assert_eq!(edits[0].path, "foo.txt");
-    let s = &edits[0].sections[0];
-    assert_eq!(s.search(), b"Hello world!");
-    assert_eq!(s.replacement(), b"Hello universe!");
+    let p = &edits[0].records[0];
+    assert_eq!(p.search(), b"Hello world!");
+    assert_eq!(p.replacement(), b"Hello universe!");
+    assert!(!p.is_assertion());
 }
 
 #[test]
-fn diff_parse_section_builder_and_replace_all() {
+fn diff_builder_records() {
     let buf = diff::build(|b| {
         b.file("test.txt", |b| {
-            b.replace_all("tabs", "spaces");
-            b.section(|s| {
-                s.anchor("prefix ")
+            b.record(|r| {
+                r.anchor("prefix ")
                     .sub("old_value", "new_value")
                     .anchor(" suffix");
             });
             b.note("careful");
-            b.replace_all("count", "total");
+            b.insert_after("import os", "\nimport sys");
+            b.delete("# TODO", "", "");
+            b.assert("def tally(items)");
         });
     });
-    let edits = diff::parse(&buf).unwrap();
-    let e = &edits[0];
     assert_eq!(
-        e.leading_replaces,
-        vec![(b"tabs".to_vec(), b"spaces".to_vec())]
+        buf,
+        parse("␖␁shape␟diff␜test.txt␞␂prefix ␃␟old_value␚␟new_value␟␂ suffix␃␇careful␞import os␟␚␟␂\nimport sys␃␞# TODO␚␟␞def tally(items)")
     );
-    let s = &e.sections[0];
-    assert_eq!(s.search(), b"prefix old_value suffix");
-    assert_eq!(s.replacement(), b"prefix new_value suffix");
-    assert_eq!(s.replaces, vec![(b"count".to_vec(), b"total".to_vec())]);
+    let edits = diff::parse(&buf).unwrap();
+    let recs = &edits[0].records;
+    assert_eq!(recs.len(), 4);
+    assert_eq!(recs[0].search(), b"prefix old_value suffix");
+    assert_eq!(recs[0].replacement(), b"prefix new_value suffix");
+    assert_eq!(recs[1].replacement(), b"import os\nimport sys");
+    assert_eq!(recs[2].replacement(), b"");
+    assert!(recs[3].is_assertion());
 }
 
 #[test]
-fn diff_apply_substitution_and_scope() {
+fn diff_apply_sequential_records() {
     let buf = diff::build(|b| {
         b.file("tally.rb", |b| {
-            b.section(|s| {
-                s.anchor("def tally(items)");
-            });
-            b.replace_all("count", "total");
-            b.section(|s| {
-                s.anchor("end");
-            });
+            b.assert("def tally(items)");
+            b.replace("  ", "count", "total", "");
+            b.assert("end");
         });
     });
     let mut files = HashMap::new();
@@ -156,11 +160,46 @@ fn diff_apply_errors() {
         Err(DiffError::PatternAmbiguous { .. })
     ));
 
-    let wrong_shape = b"\x16\x01shape\x1fstream\x1cf.txt\x1dx\x1ay";
     assert!(matches!(
-        diff::parse(wrong_shape),
+        diff::parse(&parse("␖␁shape␟stream␜f.txt␞x␚␟y")),
         Err(DiffError::WrongShape(_))
     ));
+    assert!(matches!(
+        diff::parse(&parse("␖␁shape␟diff␞x␚␟y␜f.txt")),
+        Err(DiffError::BeforeAnyFile)
+    ));
+    assert!(matches!(
+        diff::parse(&parse("␖␁shape␟diff␜␞x␚␟y")),
+        Err(DiffError::EmptyPath)
+    ));
+    assert!(matches!(
+        diff::parse(&parse("␖␁shape␟diff␜a␞x␚␟y␜a␞p␚␟q")),
+        Err(DiffError::DuplicatePath(_))
+    ));
+    // every slot the diff does not use is refused
+    for bad in [
+        "␜a␝s␞x␚␟y",
+        "␜a␁␞h␞x␚␟y",
+        "␜a␞␁k␟x␚␁k␟y",
+        "␜a␞␐␞x␘␚␟y",
+        "␜a␞␅x␚␟y",
+        "␜a␞x␚␟y␚␟z",
+        "␜a␞x␚␞y",
+        "␜a␞x␚␟y␇␞p␚␟q",
+        "␜a␞x␚␟y␇␜b␞p␚␟q",
+        "␜a␞x␟␚␟␟y",
+    ] {
+        let diffbuf = parse(&format!("␖␁shape␟diff{bad}"));
+        assert!(
+            matches!(diff::parse(&diffbuf), Err(DiffError::Refused(_))),
+            "{bad} must be refused"
+        );
+    }
+    // a hunk kept in a note is not applied
+    let mut files = HashMap::new();
+    files.insert("a.txt".to_string(), "foo bar\n".to_string());
+    let out = diff::apply(&parse("␖␁shape␟diff␜a.txt␞foo␚␟FOO␇␂␞bar␚␟BAR␃␄"), &files).unwrap();
+    assert_eq!(out["a.txt"], "FOO bar\n");
 }
 
 #[test]

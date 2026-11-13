@@ -50,11 +50,14 @@ fn strs(v: &Value) -> Vec<&str> {
         .collect()
 }
 
-// Flatten a group list with "sections" into (depth, group) pairs.
+// Flatten a group list with "sections" into (depth, group) pairs. A
+// section with a null name is a skipped depth: no group stands there.
 fn flat_groups(groups: &[Value], depth: usize) -> Vec<(usize, &Value)> {
     let mut out = Vec::new();
     for g in groups {
-        out.push((depth, g));
+        if g["name"].is_string() {
+            out.push((depth, g));
+        }
         if let Some(secs) = g.get("sections").and_then(Value::as_array) {
             out.extend(flat_groups(secs, depth + 1));
         }
@@ -74,13 +77,17 @@ fn check_value(rec: &Record, i: usize, f: &Value, case: &str) {
     } else if let Some(lvl) = f.get("level") {
         check_body(&rec.level(i).unwrap(), lvl, case);
     } else if let Some(r) = f.get("ref") {
-        let got = rec.reference(i).unwrap();
-        let want: Vec<Vec<u8>> = match r.as_str() {
-            Some(s) => vec![s.as_bytes().to_vec()],
-            None => strs(r).iter().map(|s| s.as_bytes().to_vec()).collect(),
-        };
-        let path: Vec<Vec<u8>> = got.path().iter().map(|s| s.to_vec()).collect();
-        assert_eq!(path, want, "{case}: field {i} ref");
+        let got = rec.reference(i).unwrap_or_else(|e| panic!("{case}: {e}"));
+        match r.as_str() {
+            Some(s) => {
+                assert_eq!(got.name(), Some(s.as_bytes()), "{case}: field {i} ref");
+                assert!(got.pattern().is_none(), "{case}: field {i} is a plain ref");
+            }
+            None => {
+                assert!(got.name().is_none(), "{case}: field {i} is a pattern");
+                check_body(got.pattern().unwrap(), &r["level"], case);
+            }
+        }
     } else {
         panic!("{case}: unknown value form {f}");
     }
@@ -172,9 +179,10 @@ fn check_files(body: &Body, files: &[Value], case: &str) {
         let fv = &body.files()[i];
         assert_eq!(
             fv.name(),
-            f["name"].as_str().unwrap().as_bytes(),
+            f["name"].as_str().unwrap_or("").as_bytes(),
             "{case}: file name"
         );
+        assert_eq!(fv.is_leading(), f["name"].is_null(), "{case}: leading file");
         let groups: Vec<&Group> = fv.groups().iter().collect();
         check_groups(&groups, f["groups"].as_array().unwrap(), case);
     }
@@ -212,7 +220,7 @@ fn build_value(b: &mut Builder, f: &Value) {
     } else if let Some(r) = f.get("ref") {
         match r.as_str() {
             Some(s) => b.reference(s),
-            None => b.reference_path(&strs(r)),
+            None => b.reference_level(|b| build_body(b, &r["level"])),
         };
     } else if let Some(m) = f.get("map") {
         b.level(|b| build_record(b, &serde_json::json!({ "keys": m })));
@@ -242,18 +250,21 @@ fn build_record(b: &mut Builder, r: &Value) {
     }
 }
 
-fn build_groups(b: &mut Builder, groups: &[Value]) {
+fn build_groups(b: &mut Builder, groups: &[Value], depth: usize) {
     for (i, g) in groups.iter().enumerate() {
         let headers: Option<Vec<&str>> = g["headers"].as_array().map(|_| strs(&g["headers"]));
-        if g["name"].as_str() == Some("") && i == 0 {
+        if g["name"].as_str() == Some("") && i == 0 && depth == 1 {
             if let Some(h) = &headers {
                 b.header(h); // the unnamed leading group: no GS
             }
-        } else {
-            b.group(g["name"].as_str().unwrap(), headers.as_deref());
+        } else if let Some(name) = g["name"].as_str() {
+            b.group_at(name, headers.as_deref(), depth);
         }
         for r in g["records"].as_array().unwrap() {
             build_record(b, r);
+        }
+        if let Some(secs) = g.get("sections").and_then(Value::as_array) {
+            build_groups(b, secs, depth + 1);
         }
     }
 }
@@ -267,7 +278,14 @@ fn build_body(b: &mut Builder, e: &Value) {
             build_record(b, r);
         }
     } else if let Some(groups) = e.get("groups") {
-        build_groups(b, groups.as_array().unwrap());
+        build_groups(b, groups.as_array().unwrap(), 1);
+    } else if let Some(files) = e.get("files") {
+        for f in files.as_array().unwrap() {
+            if let Some(name) = f["name"].as_str() {
+                b.fs(name);
+            }
+            build_groups(b, f["groups"].as_array().unwrap(), 1);
+        }
     }
 }
 
@@ -329,7 +347,7 @@ fn encode() {
             if let Some(file) = build["file"].as_str() {
                 b.file(file);
             }
-            build_groups(b, build["groups"].as_array().unwrap());
+            build_groups(b, build["groups"].as_array().unwrap(), 1);
         };
         let canon = Builder::build(emit);
         assert_eq!(
@@ -500,7 +518,7 @@ fn stream() {
     for c in cases("stream.json") {
         let case = c["name"].as_str().unwrap();
         let bytes = hex_bytes(c["bytes"].as_str().unwrap());
-        let r = StreamReader::new(&bytes);
+        let r = StreamReader::continuing(&bytes);
         assert_eq!(
             r.committed_end(),
             c["committed_end"].as_u64().unwrap() as usize,
@@ -529,4 +547,23 @@ fn stream() {
             assert_eq!(got, want, "{case}: records");
         }
     }
+}
+
+#[test]
+fn every_vector_file_is_run() {
+    let counts = [
+        ("decode.json", 97),
+        ("encode.json", 19),
+        ("canonical.json", 28),
+        ("invalid.json", 60),
+        ("stream.json", 20),
+        ("nested.json", 12),
+        ("diff.json", 41),
+    ];
+    let mut total = 0;
+    for (file, n) in counts {
+        assert_eq!(cases(file).len(), n, "{file}: case count");
+        total += n;
+    }
+    assert_eq!(total, 277);
 }

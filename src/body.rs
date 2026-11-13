@@ -1,13 +1,13 @@
-//! Zero-copy index of a document body: files, groups, header rows and
-//! records, each a slice into the original buffer.
+//! Zero-copy navigator for a document body: files, groups, header rows and
+//! records, each a slice into the original buffer. The structure is built
+//! once by the [`Parser`] with dead and superseded elements dropped.
 
 use crate::*;
 use std::borrow::Cow;
 use std::fmt;
 
 /// A document body: the bytes between a heading and EOT, or the inside of
-/// a nested level. Indexes files, groups, header rows and records once;
-/// everything it returns borrows the original buffer.
+/// a nested level. Everything it returns borrows the original buffer.
 ///
 /// Records before the first GS of a file form an unnamed group; records
 /// and groups before the first FS form an unnamed file.
@@ -19,21 +19,14 @@ pub struct Body<'a> {
 }
 
 impl<'a> Body<'a> {
-    /// Index a whole buffer as a body (no SYN, no EOT).
+    /// Parse a whole buffer as a body (no SYN, no EOT).
     pub fn new(buf: &'a [u8]) -> Result<Self> {
         Self::slice(buf, 0, buf.len())
     }
 
-    /// Index `buf[start..stop]` as a body.
+    /// Parse `buf[start..stop]` as a body.
     pub fn slice(buf: &'a [u8], start: usize, stop: usize) -> Result<Self> {
-        let mut body = Body {
-            buf,
-            start,
-            stop,
-            files: Vec::new(),
-        };
-        body.index()?;
-        Ok(body)
+        Self::parse(buf, start, stop, false)
     }
 
     /// The contents of a nested level: `raw` is a unit holding `DLE … CAN`
@@ -44,7 +37,37 @@ impl<'a> Body<'a> {
             return Err(Error::other("unit is not a nested level"));
         }
         let stop = scan::level(t, 0, t.len())?;
-        Self::slice(t, 1, stop - 1)
+        Self::parse(t, 1, stop - 1, true)
+    }
+
+    fn parse(buf: &'a [u8], start: usize, stop: usize, level: bool) -> Result<Self> {
+        let mut parser = Parser::new(buf, false);
+        let (files, pos) = parser.body(start, stop, level)?;
+        let pos = scan::layout(buf, pos, stop);
+        if pos < stop {
+            return Err(Error::syntax("unexpected byte in body", pos));
+        }
+        Ok(Body {
+            buf,
+            start,
+            stop,
+            files,
+        })
+    }
+
+    /// A body already parsed (used by the parser).
+    pub(crate) fn from_parts(
+        buf: &'a [u8],
+        start: usize,
+        stop: usize,
+        files: Vec<FileView<'a>>,
+    ) -> Self {
+        Body {
+            buf,
+            start,
+            stop,
+            files,
+        }
     }
 
     /// The buffer the body indexes.
@@ -124,7 +147,7 @@ impl<'a> Body<'a> {
     /// unnamed group.
     pub fn bare(&self) -> bool {
         self.files.len() == 1
-            && self.files[0].name().is_empty()
+            && self.files[0].leading
             && self.files[0].groups.len() <= 1
             && self.files[0].groups.first().is_none_or(|g| g.depth == 0)
     }
@@ -132,235 +155,37 @@ impl<'a> Body<'a> {
     fn first_file(&self) -> &FileView<'a> {
         &self.files[0]
     }
-
-    // ------------------------------------------------------------------
-
-    fn index(&mut self) -> Result<()> {
-        let buf = self.buf;
-        let stop = self.stop;
-        let mut pos = scan::layout(buf, self.start, stop);
-        // leading unnamed file
-        let mut file = FileView::new(buf, 0, 0);
-        pos = index_part(buf, pos, stop, &mut file, false)?;
-        let fs_follows = pos < stop && (buf[pos] == FS || dead_fs(buf, pos, stop));
-        let mut unnamed = Some(file);
-        if !(unnamed.as_ref().is_some_and(|f| f.groups.is_empty()) && fs_follows) {
-            self.files.extend(unnamed.take());
-        }
-        while pos < stop {
-            let mut b = buf[pos];
-            let mut dead = false;
-            if b == BEL && dead_fs(buf, pos, stop) {
-                dead = true;
-                pos = scan::layout(buf, pos + 1, stop);
-                b = FS;
-            }
-            if b != FS {
-                break;
-            }
-            pos = scan::layout(buf, pos + 1, stop);
-            let ns = pos;
-            pos = scan::plain(buf, pos, stop);
-            if dead {
-                // a dead file line is read as if absent: what follows belongs
-                // to the file before it, its leading items to that file's
-                // last group
-                if self.files.is_empty() {
-                    self.files.extend(unnamed.take());
-                }
-                let i = self.files.len() - 1;
-                pos = index_part(buf, pos, stop, &mut self.files[i], true)?;
-            } else {
-                let mut f = FileView::new(buf, ns, pos);
-                pos = index_part(buf, pos, stop, &mut f, false)?;
-                self.files.push(f);
-            }
-        }
-        if self.files.is_empty() {
-            self.files.push(FileView::new(buf, 0, 0));
-        }
-        Ok(())
-    }
 }
 
-fn dead_fs(buf: &[u8], pos: usize, stop: usize) -> bool {
-    if !(pos < stop && buf[pos] == BEL) {
-        return false;
-    }
-    let p2 = scan::layout(buf, pos + 1, stop);
-    p2 < stop && buf[p2] == FS
-}
-
-fn has_content(g: &Group<'_>) -> bool {
-    g.header.is_some() || !g.records.is_empty()
-}
-
-// Index one part: leading items (the unnamed group, or the file's last
-// group when continuing after a dead file line), then groups. Returns the
-// position of the next FS (or dead FS), or stop.
-fn index_part<'a>(
-    buf: &'a [u8],
-    mut pos: usize,
-    stop: usize,
-    file: &mut FileView<'a>,
-    cont: bool,
-) -> Result<usize> {
-    // the group a dead group line's contents attach to: an index into
-    // file.groups, or the still-pending unnamed group
-    let mut current: Option<usize> = None;
-    let mut pending: Option<Group<'a>> = None;
-    if cont && !file.groups.is_empty() {
-        let i = file.groups.len() - 1;
-        pos = index_group_contents(buf, pos, stop, &mut file.groups[i])?;
-        current = Some(i);
-    } else {
-        let mut g = Group::new(buf, 0, 0, 0);
-        pos = index_group_contents(buf, pos, stop, &mut g)?;
-        if has_content(&g) {
-            file.groups.push(g);
-            current = Some(file.groups.len() - 1);
-        } else {
-            pending = Some(g);
-        }
-    }
-    while pos < stop {
-        let mut b = buf[pos];
-        let mut dead = false;
-        if b == BEL {
-            let p2 = scan::layout(buf, pos + 1, stop);
-            if p2 < stop && buf[p2] == GS {
-                dead = true;
-                pos = p2;
-                b = GS;
-            } else {
-                break;
-            }
-        }
-        if b != GS {
-            break;
-        }
-        let mut depth = 0;
-        while pos < stop && (buf[pos] == GS || is_layout(buf[pos])) {
-            if buf[pos] == GS {
-                depth += 1;
-            }
-            pos += 1;
-        }
-        let ns = pos;
-        pos = scan::plain(buf, pos, stop);
-        let ne = pos;
-        if dead {
-            // a dead group line: what follows still belongs to the group before
-            match current {
-                Some(i) => pos = index_group_contents(buf, pos, stop, &mut file.groups[i])?,
-                None => {
-                    if let Some(mut g) = pending.take() {
-                        pos = index_group_contents(buf, pos, stop, &mut g)?;
-                        if has_content(&g) {
-                            file.groups.push(g);
-                            current = Some(file.groups.len() - 1);
-                        } else {
-                            pending = Some(g);
-                        }
-                    }
-                }
-            }
-        } else {
-            let mut grp = Group::new(buf, depth, ns, ne);
-            pos = index_group_contents(buf, pos, stop, &mut grp)?;
-            file.groups.push(grp);
-            current = Some(file.groups.len() - 1);
-        }
-    }
-    Ok(pos)
-}
-
-// After a group label (or at the start of a part): notes, header row,
-// items. Returns the position of the next GS/FS/dead GS/FS or stop.
-fn index_group_contents<'a>(
-    buf: &'a [u8],
-    mut pos: usize,
-    stop: usize,
-    grp: &mut Group<'a>,
-) -> Result<usize> {
-    let mut first_item = true;
-    loop {
-        pos = scan::layout(buf, pos, stop);
-        if pos >= stop {
-            break;
-        }
-        let b = buf[pos];
-        if b == RS {
-            first_item = false;
-            let rs = pos + 1;
-            pos = scan::record_end(buf, rs, stop)?;
-            grp.records
-                .push(Record::new(buf, rs, trim_end(buf, rs, pos)));
-        } else if b == SOH {
-            let p2 = scan::layout(buf, pos + 1, stop);
-            if !(p2 < stop && buf[p2] == RS) {
-                return Err(Error::syntax("keyed unit outside a record", pos));
-            }
-            if !first_item {
-                return Err(Error::syntax(
-                    "header row not at the start of its group",
-                    pos,
-                ));
-            }
-            first_item = false;
-            let hs = p2 + 1;
-            pos = scan::record_end(buf, hs, stop)?;
-            grp.header = Some(Record::new(buf, hs, trim_end(buf, hs, pos)));
-        } else if b == ETB {
-            pos = scan::plain(buf, scan::layout(buf, pos + 1, stop), stop);
-        } else if b == BEL {
-            let p2 = scan::layout(buf, pos + 1, stop);
-            if p2 >= stop || buf[p2] >= 0x20 || buf[p2] == STX {
-                pos = scan::comment(buf, pos, stop)?; // a note
-            } else if buf[p2] == RS || buf[p2] == SOH {
-                pos = scan::comment(buf, pos, stop)?; // dead record / header row
-                if buf[p2] == RS {
-                    first_item = false;
-                }
-            } else {
-                break; // dead GS or FS: the caller's business
-            }
-        } else {
-            break;
-        }
-    }
-    Ok(pos)
-}
-
-#[inline]
-fn trim_end(buf: &[u8], start: usize, mut stop: usize) -> usize {
-    while stop > start && is_layout(buf[stop - 1]) {
-        stop -= 1;
-    }
-    stop
-}
-
-/// A file within a body: its name and groups.
+/// A file within a body: its name and groups. The leading file is the
+/// unnamed one before the first FS.
 pub struct FileView<'a> {
     buf: &'a [u8],
     name_start: usize,
     name_end: usize,
-    groups: Vec<Group<'a>>,
+    pub(crate) groups: Vec<Group<'a>>,
+    pub(crate) leading: bool,
 }
 
 impl<'a> FileView<'a> {
-    fn new(buf: &'a [u8], name_start: usize, name_end: usize) -> Self {
+    pub(crate) fn new(buf: &'a [u8], name_start: usize, name_end: usize, leading: bool) -> Self {
         FileView {
             buf,
             name_start,
             name_end,
             groups: Vec::new(),
+            leading,
         }
     }
 
     /// The file's name (empty for the unnamed file).
     pub fn name(&self) -> &'a [u8] {
         trim(&self.buf[self.name_start..self.name_end])
+    }
+
+    /// Whether this is the unnamed file before the first FS.
+    pub fn is_leading(&self) -> bool {
+        self.leading
     }
 
     /// The file's groups, in order.
@@ -381,18 +206,18 @@ impl<'a> FileView<'a> {
 /// optional header row and records.
 pub struct Group<'a> {
     buf: &'a [u8],
-    depth: usize,
+    pub(crate) depth: usize,
     name_start: usize,
     name_end: usize,
-    header: Option<Record<'a>>,
-    records: Vec<Record<'a>>,
+    pub(crate) header: Option<Record<'a>>,
+    pub(crate) records: Vec<Record<'a>>,
 }
 
 /// A group read as a table is itself.
 pub type Table<'a> = Group<'a>;
 
 impl<'a> Group<'a> {
-    fn new(buf: &'a [u8], depth: usize, name_start: usize, name_end: usize) -> Self {
+    pub(crate) fn new(buf: &'a [u8], depth: usize, name_start: usize, name_end: usize) -> Self {
         Group {
             buf,
             depth,
@@ -426,7 +251,7 @@ impl<'a> Group<'a> {
     /// Header names, or an empty vector.
     pub fn headers(&self) -> Vec<&'a [u8]> {
         match &self.header {
-            Some(h) => h.fields().into_iter().map(trim).collect(),
+            Some(h) => h.fields().into_iter().map(name_value).collect(),
             None => Vec::new(),
         }
     }
@@ -458,10 +283,56 @@ impl<'a> Group<'a> {
     }
 }
 
+// The logical value of a unit that holds a name (plain, never text, with
+// notes allowed after it), borrowed from the buffer.
+fn name_value(raw: &[u8]) -> &[u8] {
+    match value(raw) {
+        Ok(Cow::Borrowed(b)) => b,
+        _ => trim(raw),
+    }
+}
+
 /// A key and its logical value, from a keyed record.
 pub type Pair<'a> = (&'a [u8], Cow<'a, [u8]>);
 
-/// A record: positional or keyed. Copyable, zero-copy accessors.
+/// One unit of a positional record as written: its raw bytes and whether
+/// the unit after it supersedes it (`old␚␟new`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Unit<'a> {
+    raw: &'a [u8],
+    superseded: bool,
+}
+
+impl<'a> Unit<'a> {
+    /// Raw bytes of the unit (layout at its edges included, the SUB not).
+    pub fn raw(&self) -> &'a [u8] {
+        self.raw
+    }
+
+    /// Whether the unit after this one supersedes it.
+    pub fn superseded(&self) -> bool {
+        self.superseded
+    }
+
+    /// The logical value.
+    pub fn value(&self) -> Result<Cow<'a, [u8]>> {
+        value(self.raw)
+    }
+}
+
+impl fmt::Debug for Unit<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Unit")
+            .field("raw", &String::from_utf8_lossy(self.raw))
+            .field("superseded", &self.superseded)
+            .finish()
+    }
+}
+
+/// A record: positional or keyed. Copyable, zero-copy accessors. The
+/// positional and keyed accessors report the record's **result**: a
+/// superseded unit is not among them; [`Record::units`] lists every unit
+/// as written.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Record<'a> {
     buf: &'a [u8],
@@ -488,17 +359,23 @@ impl<'a> Record<'a> {
         &self.buf[self.start..self.end]
     }
 
-    /// Whether the record is keyed (its first live or dead unit is an SOH).
+    /// Offset of the record's first byte in the buffer.
+    pub fn offset(&self) -> usize {
+        self.start
+    }
+
+    /// Whether the record is keyed (its first unit, live, dead or
+    /// superseding, is an SOH).
     pub fn keyed(&self) -> bool {
         let buf = self.buf;
         let end = self.end;
         let mut p = scan::layout(buf, self.start, end);
-        while p < end && buf[p] == BEL {
+        while p < end && (buf[p] == BEL || buf[p] == SUB) {
             let p2 = scan::layout(buf, p + 1, end);
             if p2 < end && buf[p2] == SOH {
                 return true;
             }
-            if p2 < end && buf[p2] < 0x20 && buf[p2] != STX && buf[p2] != DLE {
+            if p2 >= end || buf[p] == SUB || (buf[p2] < 0x20 && buf[p2] != STX) {
                 break;
             }
             match scan::comment(buf, p, end) {
@@ -511,24 +388,35 @@ impl<'a> Record<'a> {
 
     // ---- positional -----------------------------------------------------
 
-    /// Raw slice of unit `n` (layout at its edges included); empty when
-    /// there is no such unit.
+    /// Raw slice of unit `n` of the result (layout at its edges included);
+    /// empty when there is no such unit.
     pub fn field(&self, n: usize) -> &'a [u8] {
         self.unit_ranges()
             .get(n)
             .map_or(&[][..], |&(s, e)| &self.buf[s..e])
     }
 
-    /// Number of positional units (0 for a keyed record).
+    /// Number of positional units in the result (0 for a keyed record).
     pub fn field_count(&self) -> usize {
         self.unit_ranges().len()
     }
 
-    /// Raw slices of every unit.
+    /// Raw slices of every unit of the result.
     pub fn fields(&self) -> Vec<&'a [u8]> {
         self.unit_ranges()
             .into_iter()
             .map(|(s, e)| &self.buf[s..e])
+            .collect()
+    }
+
+    /// Every unit as written, superseded ones included.
+    pub fn units(&self) -> Vec<Unit<'a>> {
+        self.written_units()
+            .into_iter()
+            .map(|(s, e, superseded)| Unit {
+                raw: &self.buf[s..e],
+                superseded,
+            })
             .collect()
     }
 
@@ -577,7 +465,7 @@ impl<'a> Record<'a> {
 
     // ---- keyed ---------------------------------------------------------
 
-    /// Keys in written order (duplicates included).
+    /// Keys of the result in written order (duplicates included).
     pub fn keys(&self) -> Vec<&'a [u8]> {
         self.keyed_ranges()
             .unwrap_or_default()
@@ -586,7 +474,7 @@ impl<'a> Record<'a> {
             .collect()
     }
 
-    /// (key, logical value) pairs in written order.
+    /// (key, logical value) pairs of the result in written order.
     pub fn pairs(&self) -> Result<Vec<Pair<'a>>> {
         self.keyed_ranges()?
             .into_iter()
@@ -621,10 +509,10 @@ impl<'a> Record<'a> {
 
     // ---- internals ------------------------------------------------------
 
-    // (start, end) of each positional unit. A record comes from an indexed
-    // body, whose text and levels were already scanned, so the unit scan
-    // cannot fail; should it, the unit runs to the record's end.
-    fn unit_ranges(&self) -> Vec<(usize, usize)> {
+    // (start, end, superseded) of each positional unit as written. A record
+    // comes from a parsed body, whose text and levels were already checked,
+    // so the unit scan cannot fail; should it, the unit runs to the end.
+    fn written_units(&self) -> Vec<(usize, usize, bool)> {
         let buf = self.buf;
         let end = self.end;
         let mut out = Vec::new();
@@ -635,17 +523,35 @@ impl<'a> Record<'a> {
         let mut unit_start = self.start;
         loop {
             pos = scan::unit(buf, pos, end).unwrap_or(end);
-            out.push((unit_start, pos));
-            if !(pos < end && buf[pos] == US) {
+            let mut superseded = false;
+            let mut next = pos;
+            if pos < end && buf[pos] == SUB {
+                let p2 = scan::layout(buf, pos + 1, end);
+                if p2 < end && buf[p2] == US {
+                    superseded = true;
+                    next = p2;
+                }
+            }
+            out.push((unit_start, pos, superseded));
+            if !(next < end && buf[next] == US) {
                 break;
             }
-            pos += 1;
+            pos = next + 1;
             unit_start = pos;
         }
         out
     }
 
-    // (key, value start, value end) per live keyed unit.
+    // (start, end) of each positional unit of the result.
+    fn unit_ranges(&self) -> Vec<(usize, usize)> {
+        self.written_units()
+            .into_iter()
+            .filter(|&(_, _, sup)| !sup)
+            .map(|(s, e, _)| (s, e))
+            .collect()
+    }
+
+    // (key, value start, value end) per keyed unit of the result.
     fn keyed_ranges(&self) -> Result<Vec<(&'a [u8], usize, usize)>> {
         let buf = self.buf;
         let end = self.end;
@@ -661,11 +567,21 @@ impl<'a> Record<'a> {
                 }
                 let vs = ke + 1;
                 let ve = scan::unit(buf, vs, end)?;
-                out.push((trim(&buf[ks..ke]), vs, ve));
+                let mut superseded = false;
                 pos = ve;
+                if ve < end && buf[ve] == SUB {
+                    let p2 = scan::layout(buf, ve + 1, end);
+                    if p2 < end && buf[p2] == SOH {
+                        superseded = true;
+                        pos = p2;
+                    }
+                }
+                if !superseded {
+                    out.push((trim(&buf[ks..ke]), vs, ve));
+                }
             } else if b == BEL {
                 pos = scan::comment(buf, pos, end)?;
-            } else if is_layout(b) {
+            } else if b == SUB || is_layout(b) {
                 pos += 1;
             } else {
                 break;
@@ -675,74 +591,125 @@ impl<'a> Record<'a> {
     }
 }
 
-/// A reference: a group name, or a path of two or three segments
-/// (group, record id, field name).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A reference (DESIGN.md, References): a group name written plain, or a
+/// pattern, a level that is one branch of the target with its values left
+/// out. The pattern is reported as the level it is written as.
 pub struct Reference<'a> {
-    path: Vec<Cow<'a, [u8]>>,
+    name: Option<&'a [u8]>,
+    pattern: Option<Body<'a>>,
+}
+
+impl fmt::Debug for Reference<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let path: Vec<String> = self
+            .path()
+            .iter()
+            .map(|s| String::from_utf8_lossy(s).into_owned())
+            .collect();
+        f.debug_struct("Reference")
+            .field("group", &self.name.is_some())
+            .field("path", &path)
+            .finish()
+    }
 }
 
 impl<'a> Reference<'a> {
-    /// Parse a raw unit holding `ENQ name` or `ENQ STX a US b [US c] ETX`.
+    pub(crate) fn new(name: Option<&'a [u8]>, pattern: Option<Body<'a>>) -> Self {
+        Reference { name, pattern }
+    }
+
+    /// Parse a raw unit holding a reference (notes after it allowed).
     pub fn parse(raw: &'a [u8]) -> Result<Self> {
         let t = trim(raw);
         if t.first() != Some(&ENQ) {
             return Err(Error::other("unit is not a reference"));
         }
-        let p = scan::layout(t, 1, t.len());
-        if p < t.len() && t[p] == STX {
-            let stop = scan::text(t, p, t.len())?;
-            let inside = decode_text(&t[p + 1..stop - 1]);
-            let segs: Vec<Cow<'a, [u8]>> = match inside {
-                Cow::Borrowed(s) => s.split(|&b| b == US).map(Cow::Borrowed).collect(),
-                Cow::Owned(v) => v
-                    .split(|&b| b == US)
-                    .map(|s| Cow::Owned(s.to_vec()))
-                    .collect(),
-            };
-            if segs.len() > 3 {
-                return Err(Error::syntax(
-                    "reference path with more than three segments",
-                    p,
-                ));
+        let mut parser = Parser::new(t, false);
+        let (r, pos) = parser.reference(0, t.len())?;
+        let mut pos = scan::layout(t, pos, t.len());
+        while pos < t.len() {
+            if t[pos] != BEL {
+                return Err(Error::syntax("unexpected byte after a reference", pos));
             }
-            if segs.iter().any(|s| s.is_empty()) {
-                return Err(Error::syntax("reference path with an empty segment", p));
-            }
-            if segs.iter().any(|s| !is_name(s)) {
-                return Err(Error::syntax("reference path segment is not a name", p));
-            }
-            Ok(Reference { path: segs })
+            pos = scan::layout(t, scan::comment(t, pos, t.len())?, t.len());
+        }
+        Ok(r)
+    }
+
+    /// The group name of a plain reference, or `None` for a pattern.
+    pub fn name(&self) -> Option<&'a [u8]> {
+        self.name
+    }
+
+    /// The pattern of `ENQ DLE … CAN`, or `None` for a plain reference.
+    pub fn pattern(&self) -> Option<&Body<'a>> {
+        self.pattern.as_ref()
+    }
+
+    /// Whether the reference names a group as a whole: a plain name, or a
+    /// pattern that is a bare group line.
+    pub fn is_group(&self) -> bool {
+        if self.name.is_some() {
+            return true;
+        }
+        let p = self
+            .pattern
+            .as_ref()
+            .expect("a reference is a name or a pattern");
+        let groups: Vec<&Group<'a>> = p.groups().collect();
+        p.files()[0].is_leading() && groups.len() == 1 && groups[0].records().is_empty()
+    }
+
+    /// The group named, when the reference names a group as a whole.
+    pub fn group_name(&self) -> Option<&'a [u8]> {
+        if let Some(n) = self.name {
+            return Some(n);
+        }
+        if self.is_group() {
+            self.pattern
+                .as_ref()
+                .and_then(|p| p.groups().next().map(|g| g.name()))
         } else {
-            let name = trim(&t[p..]);
-            if name.is_empty() {
-                return Err(Error::syntax("reference without a name", p));
-            }
-            Ok(Reference {
-                path: vec![Cow::Borrowed(name)],
-            })
+            None
         }
     }
 
-    /// The segments: group, then record id and field name when present.
-    pub fn path(&self) -> &[Cow<'a, [u8]>] {
-        &self.path
-    }
-
-    pub fn group(&self) -> &[u8] {
-        &self.path[0]
-    }
-
-    pub fn record(&self) -> Option<&[u8]> {
-        self.path.get(1).map(|s| s.as_ref())
-    }
-
-    pub fn field(&self) -> Option<&[u8]> {
-        self.path.get(2).map(|s| s.as_ref())
-    }
-
-    /// Whether the reference names a whole group.
-    pub fn is_group(&self) -> bool {
-        self.path.len() == 1
+    /// The steps of the pattern in walking order (file, groups, record id,
+    /// field name, then the inner pattern's steps), or the group name
+    /// alone. Informal: a keyed step contributes its key.
+    pub fn path(&self) -> Vec<&'a [u8]> {
+        if let Some(n) = self.name {
+            return vec![n];
+        }
+        let mut out = Vec::new();
+        let Some(p) = self.pattern.as_ref() else {
+            return out;
+        };
+        let f = &p.files()[0];
+        if !f.is_leading() {
+            out.push(f.name());
+        }
+        for g in f.groups() {
+            if g.depth() > 0 {
+                out.push(g.name());
+            }
+        }
+        let Some(rec) = f.groups().last().and_then(|g| g.records().first()) else {
+            return out;
+        };
+        if rec.keyed() {
+            if let Some(k) = rec.keys().first() {
+                out.push(k);
+            }
+        } else {
+            for (i, raw) in rec.fields().into_iter().enumerate() {
+                if i < 2 {
+                    out.push(name_value(raw));
+                } else if let Ok(inner) = Body::of_level(raw) {
+                    out.extend(Reference::new(None, Some(inner)).path());
+                }
+            }
+        }
+        out
     }
 }
