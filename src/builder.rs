@@ -22,16 +22,18 @@ use crate::*;
 /// that may stand bare come in two spellings: the bare code (`rs()`, `us()`,
 /// `gs()`, `soh()`, `bel()`, `etb()`) and the code with what follows it
 /// (`rs_value`, `us_value`, `gs_name`, `soh_key`, `bel_note`,
-/// `etb_payload`). `sub` is always bare: it supersedes the element before
-/// the next separator or opener by the one after (`old␚␟new`). A reference
-/// is `enq(name)` or `enq_level(|b| …)`, a pattern:
+/// `etb_payload`). `sub` is always bare: the element after the next
+/// separator is subordinate to the one before it, before GS a subsection
+/// (`␚␝s`), before US a sub-unit (`old␚␟new`). A reference is `enq(name)`
+/// or `enq_level(|b| …)`, a pattern:
 ///
 /// ```
 /// let buf = c0::Builder::build(|b| {
 ///     b.rs_value("Alice").us_value("1502.30");          // ␞Alice␟1502.30
 ///     b.rs().soh_key("host").us_value("localhost");     // ␞␁host␟localhost
 ///     b.bel().gs_name("old");                           // ␇␝old: a dead group
-///     b.rs_value("old").sub().us_value("new");          // ␞old␚␟new: old superseded by new
+///     b.sub().gs_name("intro");                         // ␚␝intro: a subsection (depth 2)
+///     b.rs_value("old").sub().us_value("new");          // ␞old␚␟new: new is a sub-unit of old
 ///     b.rs().enq("tags").us().enq_level(|b| {           // ␞␅tags␟␅␐␝tags␞001␘
 ///         b.gs_name("tags").rs_value("001");
 ///     });
@@ -39,7 +41,7 @@ use crate::*;
 /// ```
 ///
 /// The composed methods (`file`, `group`, `header`, `record`, `field`,
-/// `map`, `key`, `level`, `list`, `reference`, `supersede`, `note`, …) are
+/// `map`, `key`, `level`, `list`, `reference`, `sub_unit`, `note`, …) are
 /// built on the
 /// primitives and cannot write ill-formed output. The primitives write what
 /// you spell; well-formedness is then yours to keep. Both layers share the
@@ -100,8 +102,8 @@ impl Builder {
         self
     }
 
-    /// A bare GS. `gs().gs_name("sub")` is a group at depth 2. Ends any
-    /// open record.
+    /// A bare GS: a group with an empty name (`gs().gs_name("b")` is two
+    /// groups, `""` then `b`). Ends any open record.
     pub fn gs(&mut self) -> &mut Self {
         self.end_record();
         self.buf.push(GS);
@@ -111,6 +113,19 @@ impl Builder {
     /// GS and a group name. Ends any open record.
     pub fn gs_name(&mut self, name: &str) -> &mut Self {
         self.gs();
+        self.name(name);
+        self
+    }
+
+    /// `depth − 1` SUB, GS and a group name: `gs_name_at("s", 2)` is
+    /// `␚␝s`, a subsection. Ends any open record.
+    pub fn gs_name_at(&mut self, name: &str, depth: usize) -> &mut Self {
+        assert!(depth >= 1, "a group is at depth one or deeper");
+        self.end_record();
+        for _ in 1..depth {
+            self.buf.push(SUB);
+        }
+        self.buf.push(GS);
         self.name(name);
         self
     }
@@ -146,9 +161,10 @@ impl Builder {
         self
     }
 
-    /// SUB: the element before the next separator or opener is superseded
-    /// by the element after it, at that code's grain (`old␚␟new`, `␚␞`,
-    /// `␚␝`, `␚␜`, `␚␁`). Does not change the unit count.
+    /// SUB: the element after the next separator is subordinate to the one
+    /// before it, at that code's grain: before GS a subsection (`␚␝s`, one
+    /// SUB per level), before US a sub-unit (`old␚␟new`). Does not change
+    /// the unit count.
     pub fn sub(&mut self) -> &mut Self {
         self.buf.push(SUB);
         self
@@ -297,12 +313,10 @@ impl Builder {
         self.group_at(name, headers, 1)
     }
 
-    /// GS×`depth`, a group name, and a header row when given.
+    /// A group at `depth` (`depth − 1` SUB then GS), a group name, and a
+    /// header row when given.
     pub fn group_at(&mut self, name: &str, headers: Option<&[&str]>, depth: usize) -> &mut Self {
-        for _ in 1..depth {
-            self.gs();
-        }
-        self.gs_name(name);
+        self.gs_name_at(name, depth);
         if let Some(h) = headers {
             self.header(h);
         }
@@ -327,7 +341,7 @@ impl Builder {
         self
     }
 
-    /// Document mode: a section at `depth` (GS×depth and a name).
+    /// Document mode: a section at `depth` (`depth − 1` SUB, GS and a name).
     pub fn section(&mut self, name: &str, depth: usize) -> &mut Self {
         self.group_at(name, None, depth)
     }
@@ -455,12 +469,29 @@ impl Builder {
         })
     }
 
-    /// A superseded unit: `old` superseded by `new`, written `old␚␟new`.
-    /// The record's result holds `new` alone.
-    pub fn supersede(&mut self, old: impl AsRef<[u8]>, new: impl AsRef<[u8]>) -> &mut Self {
-        self.field(old);
-        self.sub();
-        self.field(new)
+    /// A sub-unit of the unit just written: SUB, US and the value
+    /// (`␞a␚␟b`). It is not a unit of the record and does not count as
+    /// one. Opens a record if none is open: `␞␚␟b` is an empty first unit
+    /// holding `b`.
+    pub fn sub_unit(&mut self, value: impl AsRef<[u8]>) -> &mut Self {
+        self.sub_unit_at(value, 1)
+    }
+
+    /// A sub-unit at `depth`: `depth` SUB, US and the value. `depth` 2 is a
+    /// sub-unit of the sub-unit written before (`␞a␚␟b␚␚␟c`).
+    pub fn sub_unit_at(&mut self, value: impl AsRef<[u8]>, depth: usize) -> &mut Self {
+        assert!(depth >= 1, "a sub-unit is at depth one or deeper");
+        if !self.in_record {
+            self.rs();
+        }
+        for _ in 0..depth {
+            self.buf.push(SUB);
+        }
+        self.buf.push(US);
+        write_value(&mut self.buf, value.as_ref());
+        // the unit it hangs off exists, even when empty
+        self.units = self.units.max(1);
+        self
     }
 
     // ---- comments ----------------------------------------------------------

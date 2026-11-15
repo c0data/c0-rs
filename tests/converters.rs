@@ -180,11 +180,11 @@ fn diff_apply_errors() {
     for bad in [
         "␜a␝s␞x␚␟y",
         "␜a␁␞h␞x␚␟y",
-        "␜a␞␁k␟x␚␁k␟y",
+        "␜a␞␁k␟x␚␟y",
         "␜a␞␐␞x␘␚␟y",
         "␜a␞␅x␚␟y",
         "␜a␞x␚␟y␚␟z",
-        "␜a␞x␚␞y",
+        "␜a␞x␚␟y␚␚␟z",
         "␜a␞x␚␟y␇␞p␚␟q",
         "␜a␞x␚␟y␇␜b␞p␚␟q",
         "␜a␞x␟␚␟␟y",
@@ -193,6 +193,14 @@ fn diff_apply_errors() {
         assert!(
             matches!(diff::parse(&diffbuf), Err(DiffError::Refused(_))),
             "{bad} must be refused"
+        );
+    }
+    // the reserved grains (a sub-record, a sub-key) fail in the base grammar
+    for bad in ["␜a␞x␚␞y", "␜a␞␁k␟x␚␁k␟y"] {
+        let diffbuf = parse(&format!("␖␁shape␟diff{bad}"));
+        assert!(
+            matches!(diff::parse(&diffbuf), Err(DiffError::Syntax(_))),
+            "{bad} must be a syntax error"
         );
     }
     // a hunk kept in a note is not applied

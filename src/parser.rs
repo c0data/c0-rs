@@ -1,10 +1,9 @@
 //! The one parser of the base grammar (GRAMMAR.md). It walks a buffer,
 //! fails on the first structural error, builds the document model with
-//! supersession applied (the superseded element dropped), notes every
-//! canonical violation when asked, and counts what tools above the format
-//! need to know: dead elements met in bodies and the grain of every
-//! supersession. [`Body`], [`Document`], [`Container`], [`Validator`] and
-//! the stream reader are all built on it.
+//! dead elements dropped, notes every canonical violation when asked, and
+//! counts the dead elements met in bodies for tools above the format.
+//! [`Body`], [`Document`], [`Container`], [`Validator`] and the stream
+//! reader are all built on it.
 //!
 //! Body level is a flat state machine over lines (file line, group line,
 //! header row, record, note, commit); records and their values are
@@ -20,7 +19,6 @@ pub struct Parser<'a> {
     ok: bool,
     warnings: Vec<&'static str>,
     dead_elements: usize,
-    supersessions: Vec<u8>,
     // Regions to jump over at a block boundary, start => end: the damaged
     // blocks of a stream (see StreamReader).
     skip: Option<HashMap<usize, usize>>,
@@ -36,7 +34,6 @@ impl<'a> Parser<'a> {
             ok: true,
             warnings: Vec::new(),
             dead_elements: 0,
-            supersessions: Vec::new(),
             skip: None,
         }
     }
@@ -61,11 +58,6 @@ impl<'a> Parser<'a> {
     /// Dead elements met in bodies (the heading's dead keys are not counted).
     pub fn dead_elements(&self) -> usize {
         self.dead_elements
-    }
-
-    /// The code after each SUB met: US, SOH, RS, GS or FS.
-    pub fn supersessions(&self) -> &[u8] {
-        &self.supersessions
     }
 
     pub(crate) fn not_canonical(&mut self, why: &'static str) {
@@ -96,8 +88,8 @@ impl<'a> Parser<'a> {
 
     // ---- heading --------------------------------------------------------
 
-    /// After SYN. Returns the heading (superseded keys dropped, duplicates
-    /// kept) and the position of the first body code.
+    /// After SYN. Returns the heading (dead keys dropped, duplicates kept)
+    /// and the position of the first body code.
     pub fn heading(&mut self, mut pos: usize, stop: usize) -> Result<(Heading<'a>, usize)> {
         let buf = self.buf;
         let hs = pos;
@@ -147,27 +139,10 @@ impl<'a> Parser<'a> {
                 if p2 >= stop {
                     return Err(Error::syntax("SUB at the end of input", pos));
                 }
-                let c = buf[p2];
-                if c == SOH {
-                    let p3 = scan::layout(buf, p2 + 1, stop);
-                    if p3 < stop && buf[p3] == RS {
-                        break; // the body's business: an error there
-                    }
-                    if pairs.is_empty() {
-                        return Err(Error::syntax(
-                            "nothing to supersede: no keyed unit before",
-                            pos,
-                        ));
-                    }
-                    self.supersessions.push(SOH);
-                    pairs.pop();
-                    raw_pairs.pop();
-                    let (key, vs, p) = self.keyed_unit(p2 + 1, stop, true)?;
-                    pos = p;
-                    self.heading_pair(&mut pairs, &mut raw_pairs, key, trim(&buf[vs..pos]), vs)?;
-                } else {
-                    break; // SUB before a body code: the body's business
+                if buf[p2] == US {
+                    return Err(Error::syntax("the heading's values take no sub-units", pos));
                 }
+                break; // SUB before a body code: the body's business
             } else if b >= 0x20 {
                 return Err(Error::syntax("plain text directly after SYN", pos));
             } else {
@@ -250,8 +225,8 @@ impl<'a> Parser<'a> {
 
     /// A body from pos to stop. At depth zero (`level` false) commits are
     /// legal and the body ends at EOT, SYN, EM or stop; in a level it ends
-    /// at CAN. Returns the files (dead and superseded elements dropped) and
-    /// the position of the code that ended the body.
+    /// at CAN. Returns the files (dead elements dropped) and the position
+    /// of the code that ended the body.
     pub fn body(
         &mut self,
         mut pos: usize,
@@ -267,8 +242,9 @@ impl<'a> Parser<'a> {
         let mut dead_file = false; // inside a dead file: everything to the next file line is discarded
         let mut dead_depth: Option<usize> = None; // inside a dead group of this depth
         let mut dead = false; // BEL seen: the next element is dead
-        let mut sup = false; // SUB seen: the next element supersedes the one before it
-        let mut mark_at = pos; // position of that BEL or SUB, for errors
+        let mut prefix = 0usize; // SUB run read before a GS: the subsection's depth less one
+        let mut prev_depth = 0usize; // depth of the group line before, as written (dead or not)
+        let mut mark_at = pos; // position of that BEL, for errors
 
         // A group joins its file when it ends: a named one always, the
         // unnamed one once it has content.
@@ -291,31 +267,15 @@ impl<'a> Parser<'a> {
                     if dead {
                         self.dead_elements += 1;
                     } else {
-                        if sup {
-                            if group.records.is_empty() {
-                                return Err(Error::syntax(
-                                    "nothing to supersede: no record before it in the group",
-                                    mark_at,
-                                ));
-                            }
-                            group.records.pop();
-                        }
                         group.records.push(rec);
                         header_ok = false;
                     }
                     dead = false;
-                    sup = false;
                 }
                 SOH => {
                     let p2 = scan::layout(buf, pos + 1, stop);
                     if !(p2 < stop && buf[p2] == RS) {
                         return Err(Error::syntax("keyed unit outside a record", pos));
-                    }
-                    if sup {
-                        return Err(Error::syntax(
-                            "a header row admits no supersession",
-                            mark_at,
-                        ));
                     }
                     if !header_ok {
                         return Err(Error::syntax(
@@ -334,12 +294,18 @@ impl<'a> Parser<'a> {
                     dead = false;
                 }
                 GS => {
-                    let mut depth = 0;
-                    while pos < stop && buf[pos] == GS {
-                        depth += 1;
-                        pos = self.layout(pos + 1, stop);
+                    // depth is one plus the SUB prefix; a skip is measured
+                    // against the group line before, as written, dead or not
+                    let depth = 1 + prefix;
+                    prefix = 0;
+                    if depth > prev_depth + 1 {
+                        return Err(Error::syntax(
+                            "depth skipped: a group is at most one deeper than the group line before it",
+                            pos,
+                        ));
                     }
-                    let (ns, ne, p) = self.name(pos, stop)?;
+                    prev_depth = depth;
+                    let (ns, ne, p) = self.name(pos + 1, stop)?;
                     pos = p;
                     let done = std::mem::replace(&mut group, Group::new(buf, depth, ns, ne));
                     flush(&mut file, done, group_live);
@@ -352,17 +318,11 @@ impl<'a> Parser<'a> {
                             dead_depth = Some(depth);
                         }
                         group_live = false; // a dead group is parsed, never attached
-                    } else if dead_file || dead_depth.is_some() {
-                        group_live = false;
                     } else {
-                        if sup {
-                            supersede_group(&mut file.groups, depth, mark_at)?;
-                        }
-                        group_live = true;
+                        group_live = !(dead_file || dead_depth.is_some());
                     }
                     header_ok = true;
                     dead = false;
-                    sup = false;
                 }
                 FS => {
                     let (ns, ne, p) = self.name(pos + 1, stop)?;
@@ -380,26 +340,14 @@ impl<'a> Parser<'a> {
                         dead_file = true;
                     } else {
                         dead_file = false;
-                        if sup {
-                            if files.is_empty() {
-                                return Err(Error::syntax(
-                                    "nothing to supersede: no file before it",
-                                    mark_at,
-                                ));
-                            }
-                            files.pop();
-                        }
                     }
                     group_live = !dead_file;
                     dead_depth = None;
+                    prev_depth = 0; // FS restarts the depth count
                     header_ok = true;
                     dead = false;
-                    sup = false;
                 }
                 BEL => {
-                    if sup {
-                        return Err(Error::syntax("SUB before BEL", mark_at));
-                    }
                     if dead {
                         return Err(Error::syntax(
                             "BEL before a code that is not an element",
@@ -419,6 +367,28 @@ impl<'a> Parser<'a> {
                         dead = true;
                         mark_at = pos;
                         pos = p2;
+                    } else if c == SUB {
+                        // BEL kills a group line whole, its SUB prefix included
+                        let mut p3 = p2;
+                        while p3 < stop && buf[p3] == SUB {
+                            p3 = scan::layout(buf, p3 + 1, stop);
+                        }
+                        if p3 < stop && buf[p3] == GS {
+                            self.not_canonical("dead element");
+                            dead = true;
+                            mark_at = pos;
+                            pos = p2;
+                        } else if p3 < stop && buf[p3] == US {
+                            return Err(Error::syntax(
+                                "BEL before a sub-unit: a unit cannot be dead",
+                                pos,
+                            ));
+                        } else {
+                            return Err(Error::syntax(
+                                "BEL before a code that is not an element",
+                                p2,
+                            ));
+                        }
                     } else if c == DLE {
                         return Err(Error::syntax("a nested level is not an item", p2));
                     } else {
@@ -429,40 +399,46 @@ impl<'a> Parser<'a> {
                     }
                 }
                 SUB => {
-                    if dead {
-                        return Err(Error::syntax(
-                            "BEL before SUB: SUB is not an element",
-                            mark_at,
-                        ));
+                    // A run of SUB before GS is the subsection's depth prefix;
+                    // before RS, FS or SOH it is reserved; a sub-unit (SUB US)
+                    // lives inside a record and never reaches here.
+                    let start = pos;
+                    let mut run = 0usize;
+                    while pos < stop && buf[pos] == SUB {
+                        run += 1;
+                        pos = self.layout(pos + 1, stop);
                     }
-                    if sup {
-                        return Err(Error::syntax("SUB before SUB", pos));
+                    if pos >= stop {
+                        return Err(Error::syntax("SUB at the end of input", start));
                     }
-                    let p2 = scan::layout(buf, pos + 1, stop);
-                    if p2 >= stop {
-                        return Err(Error::syntax("SUB at the end of input", pos));
-                    }
-                    let c = buf[p2];
-                    if matches!(c, RS | GS | FS) {
-                        self.supersessions.push(c);
-                        sup = true;
-                        mark_at = pos;
-                        pos = p2;
-                    } else if c == SOH {
-                        let p3 = scan::layout(buf, p2 + 1, stop);
-                        if p3 < stop && buf[p3] == RS {
-                            return Err(Error::syntax("a header row admits no supersession", pos));
+                    match buf[pos] {
+                        GS => prefix = run,
+                        RS => {
+                            return Err(Error::syntax(
+                                "SUB before RS is reserved (a sub-record)",
+                                start,
+                            ))
                         }
-                        return Err(Error::syntax("keyed unit outside a record", p2));
-                    } else if c == US {
-                        return Err(Error::syntax("US outside a record", p2));
-                    } else if c == BEL {
-                        return Err(Error::syntax("SUB before BEL", pos));
-                    } else {
-                        return Err(Error::syntax(
-                            "SUB before a byte that is not a separator or opener",
-                            pos,
-                        ));
+                        FS => {
+                            return Err(Error::syntax(
+                                "SUB before FS is reserved (a sub-file)",
+                                start,
+                            ))
+                        }
+                        SOH => {
+                            return Err(Error::syntax(
+                                "SUB before SOH is reserved (a sub-key); a header row admits none",
+                                start,
+                            ))
+                        }
+                        US => return Err(Error::syntax("US outside a record", pos)),
+                        BEL => return Err(Error::syntax("SUB before BEL", start)),
+                        _ => {
+                            return Err(Error::syntax(
+                                "SUB before a byte that is not a separator",
+                                start,
+                            ))
+                        }
                     }
                 }
                 ETB => {
@@ -475,9 +451,6 @@ impl<'a> Parser<'a> {
                             mark_at,
                         ));
                     }
-                    if sup {
-                        return Err(Error::syntax("SUB before ETB", mark_at));
-                    }
                     self.not_canonical("commit");
                     let p = self.layout(pos + 1, stop);
                     pos = scan::plain(buf, p, stop);
@@ -489,9 +462,6 @@ impl<'a> Parser<'a> {
                     if dead {
                         return Err(Error::syntax("BEL before framing", mark_at));
                     }
-                    if sup {
-                        return Err(Error::syntax("SUB before framing", mark_at));
-                    }
                     break;
                 }
                 CAN => {
@@ -500,9 +470,6 @@ impl<'a> Parser<'a> {
                     }
                     if dead {
                         return Err(Error::syntax("BEL before CAN", mark_at));
-                    }
-                    if sup {
-                        return Err(Error::syntax("SUB before CAN", mark_at));
                     }
                     break;
                 }
@@ -568,7 +535,7 @@ impl<'a> Parser<'a> {
         if pos < stop && buf[pos] == SUB {
             let p2 = scan::layout(buf, pos + 1, stop);
             if p2 < stop && buf[p2] == US {
-                return Err(Error::syntax("a header row admits no supersession", pos));
+                return Err(Error::syntax("a header row admits no sub-units", pos));
             }
         }
         Ok((Record::new(buf, start, trim_end(buf, start, pos)), pos))
@@ -590,8 +557,7 @@ impl<'a> Parser<'a> {
         ))
     }
 
-    // Does the record starting here begin with a keyed unit, live, dead or
-    // superseding?
+    // Does the record starting here begin with a keyed unit, live or dead?
     fn keyed_start(&self, mut pos: usize, stop: usize) -> Result<bool> {
         let buf = self.buf;
         loop {
@@ -603,7 +569,7 @@ impl<'a> Parser<'a> {
             if b == SOH {
                 let p2 = scan::layout(buf, pos + 1, stop);
                 return Ok(!(p2 < stop && buf[p2] == RS));
-            } else if b == BEL || b == SUB {
+            } else if b == BEL {
                 let p2 = scan::layout(buf, pos + 1, stop);
                 if p2 >= stop {
                     return Ok(false);
@@ -613,7 +579,7 @@ impl<'a> Parser<'a> {
                     let p3 = scan::layout(buf, p2 + 1, stop);
                     return Ok(!(p3 < stop && buf[p3] == RS));
                 }
-                if !(b == BEL && (c >= 0x20 || c == STX)) {
+                if !(c >= 0x20 || c == STX) {
                     return Ok(false);
                 }
                 pos = self.note_content(p2, stop)?; // a note: look past it
@@ -627,6 +593,7 @@ impl<'a> Parser<'a> {
         let buf = self.buf;
         loop {
             pos = self.value(pos, stop, false)?;
+            pos = self.sub_units(pos, stop)?;
             pos = self.layout(pos, stop);
             if pos >= stop {
                 break;
@@ -635,33 +602,7 @@ impl<'a> Parser<'a> {
             if b == US {
                 pos += 1;
             } else if b == SUB {
-                let p2 = scan::layout(buf, pos + 1, stop);
-                if p2 >= stop {
-                    return Err(Error::syntax("SUB at the end of input", pos));
-                }
-                let c = buf[p2];
-                if c == US {
-                    self.supersessions.push(US);
-                    pos = p2 + 1;
-                } else if matches!(c, RS | GS | FS) {
-                    break; // qualifies the next line: the body's business
-                } else if c == SOH {
-                    let p3 = scan::layout(buf, p2 + 1, stop);
-                    if p3 < stop && buf[p3] == RS {
-                        return Err(Error::syntax("a header row admits no supersession", pos));
-                    }
-                    return Err(Error::syntax(
-                        "keyed unit in a positional record (mixed record)",
-                        p2,
-                    ));
-                } else if c == BEL {
-                    return Err(Error::syntax("SUB before BEL", pos));
-                } else {
-                    return Err(Error::syntax(
-                        "SUB before a byte that is not a separator or opener",
-                        pos,
-                    ));
-                }
+                break; // a prefix before the next line: the body's business
             } else if b == SOH {
                 let p2 = scan::layout(buf, pos + 1, stop);
                 if p2 < stop && buf[p2] == RS {
@@ -693,7 +634,7 @@ impl<'a> Parser<'a> {
                     break;
                 }
                 let (key, _vs, p) = self.keyed_unit(pos + 1, stop, false)?;
-                pos = p;
+                pos = self.sub_units(p, stop)?;
                 keys.push(key);
             } else if b == BEL {
                 let p2 = scan::layout(buf, pos + 1, stop);
@@ -712,44 +653,15 @@ impl<'a> Parser<'a> {
                 } else if c >= 0x20 || c == STX {
                     pos = self.trailing_notes(pos, stop)?;
                 } else if c == SUB {
-                    return Err(Error::syntax("BEL before SUB: SUB is not an element", p2));
+                    return Err(Error::syntax(
+                        "BEL before a sub-unit: a unit cannot be dead",
+                        p2,
+                    ));
                 } else {
                     break;
                 }
             } else if b == SUB {
-                let p2 = scan::layout(buf, pos + 1, stop);
-                if p2 >= stop {
-                    return Err(Error::syntax("SUB at the end of input", pos));
-                }
-                let c = buf[p2];
-                if c == SOH {
-                    let p3 = scan::layout(buf, p2 + 1, stop);
-                    if p3 < stop && buf[p3] == RS {
-                        return Err(Error::syntax("a header row admits no supersession", pos));
-                    }
-                    if keys.is_empty() {
-                        return Err(Error::syntax(
-                            "nothing to supersede: no keyed unit before it",
-                            pos,
-                        ));
-                    }
-                    self.supersessions.push(SOH);
-                    keys.pop();
-                    let (key, _vs, p) = self.keyed_unit(p2 + 1, stop, false)?;
-                    pos = p;
-                    keys.push(key);
-                } else if c == US {
-                    return Err(Error::syntax("US after a keyed value (mixed record)", p2));
-                } else if matches!(c, RS | GS | FS) {
-                    break;
-                } else if c == BEL {
-                    return Err(Error::syntax("SUB before BEL", pos));
-                } else {
-                    return Err(Error::syntax(
-                        "SUB before a byte that is not a separator or opener",
-                        pos,
-                    ));
-                }
+                break; // a prefix before the next line: the body's business
             } else {
                 break;
             }
@@ -781,6 +693,60 @@ impl<'a> Parser<'a> {
         let vs = pos + 1;
         let pos = self.value(vs, stop, heading)?;
         Ok((&buf[ks..ke], vs, pos))
+    }
+
+    // The sub-units after a unit's value: runs of SUB then US then a value,
+    // each run's length the sub-unit's depth, at most one deeper than the
+    // sub-unit before it. Returns the position after the last; a SUB run
+    // that prefixes a line code is left for the body, a reserved grain fails.
+    fn sub_units(&mut self, mut pos: usize, stop: usize) -> Result<usize> {
+        let buf = self.buf;
+        let mut prev = 0usize;
+        loop {
+            let mut p = self.layout(pos, stop);
+            if !(p < stop && buf[p] == SUB) {
+                return Ok(pos);
+            }
+            let start = p;
+            let mut run = 0usize;
+            while p < stop && buf[p] == SUB {
+                run += 1;
+                p = self.layout(p + 1, stop);
+            }
+            if p >= stop {
+                return Err(Error::syntax("SUB at the end of input", start));
+            }
+            match buf[p] {
+                US => {
+                    if run > prev + 1 {
+                        return Err(Error::syntax(
+                            "depth skipped: a sub-unit is at most one deeper than the sub-unit before it",
+                            start,
+                        ));
+                    }
+                    prev = run;
+                    pos = self.value(p + 1, stop, false)?;
+                }
+                RS | GS | FS => return Ok(pos), // the body's business
+                SOH => {
+                    let p2 = scan::layout(buf, p + 1, stop);
+                    if p2 < stop && buf[p2] == RS {
+                        return Err(Error::syntax("a header row admits no SUB", start));
+                    }
+                    return Err(Error::syntax(
+                        "SUB before SOH is reserved (a sub-key)",
+                        start,
+                    ));
+                }
+                BEL => return Err(Error::syntax("SUB before BEL", start)),
+                _ => {
+                    return Err(Error::syntax(
+                        "SUB before a byte that is not a separator",
+                        start,
+                    ))
+                }
+            }
+        }
     }
 
     // ---- values ---------------------------------------------------------
@@ -935,17 +901,10 @@ impl<'a> Parser<'a> {
         let b = buf[pos];
         if b == DLE {
             let dead0 = self.dead_elements;
-            let sup0 = self.supersessions.len();
             let (files, after) = self.level(pos, stop)?;
             if self.dead_elements != dead0 {
                 return Err(Error::syntax(
                     "a dead element is not a step of a pattern",
-                    pos,
-                ));
-            }
-            if self.supersessions.len() != sup0 {
-                return Err(Error::syntax(
-                    "supersession is not a step of a pattern",
                     pos,
                 ));
             }
@@ -1065,23 +1024,6 @@ impl<'a> Parser<'a> {
         }
         Ok(())
     }
-}
-
-// Remove the last group at `depth` and the deeper groups that follow it
-// (its span), so the superseding group can take its place.
-fn supersede_group(groups: &mut Vec<Group<'_>>, depth: usize, at: usize) -> Result<()> {
-    let Some(i) = groups.iter().rposition(|g| g.depth == depth) else {
-        return Err(Error::syntax(
-            "nothing to supersede: no earlier group at that depth",
-            at,
-        ));
-    };
-    let mut j = i + 1;
-    while j < groups.len() && groups[j].depth > depth {
-        j += 1;
-    }
-    groups.drain(i..j);
-    Ok(())
 }
 
 #[inline]

@@ -173,11 +173,11 @@ fn references() {
         b.reference("tags");
         b.reference_to("tags", "001", Some("label"));
         b.reference_level(|b| {
-            b.gs_name("docs").gs().gs_name("intro").rs_value("3");
+            b.gs_name("docs").gs_name_at("intro", 2).rs_value("3");
         });
     });
     assert!(canonical(&buf));
-    assert!(buf.ends_with(&parse("␅␐␝tags␞001␟label␘␟␅␐␝docs␝␝intro␞3␘")));
+    assert!(buf.ends_with(&parse("␅␐␝tags␞001␟label␘␟␅␐␝docs␚␝intro␞3␘")));
     let rec = Body::new(&buf).unwrap().group(0).record(0);
     let r = rec.reference(1).unwrap();
     assert!(r.is_group());
@@ -212,65 +212,114 @@ fn references() {
 }
 
 #[test]
-fn supersession_drops_the_superseded_element_and_keeps_the_bytes() {
-    let b2 = parse("␝g␞a␟b␚␟c␚␞x␟y");
+fn sub_is_subordinate_a_subsection_or_a_sub_unit() {
+    // SUB GS is a subsection; SUB US is a sub-unit, not a unit of the record
+    let b2 = parse("␝g␞a␟b␚␟c␚␝s␞x");
     let doc = Document::new(&b2).unwrap();
-    let g = doc.group_by_name("g").unwrap();
-    assert_eq!(g.record_count(), 1);
-    assert_eq!(g.record(0).values().unwrap(), [b"x".as_ref(), b"y"]);
-    let bb = parse("␞a␚␟b␟c");
-    let rec = Body::new(&bb).unwrap().record(0);
-    assert_eq!(rec.values().unwrap(), [b"b".as_ref(), b"c"]);
-    let units: Vec<(Vec<u8>, bool)> = rec
-        .units()
+    let groups: Vec<(&[u8], usize)> = doc.groups().map(|g| (g.name(), g.depth())).collect();
+    assert_eq!(groups, [(b"g".as_ref(), 1), (b"s".as_ref(), 2)]);
+    let rec = doc.group_by_name("g").unwrap().record(0);
+    assert_eq!(rec.values().unwrap(), [b"a".as_ref(), b"b"]);
+    assert_eq!(rec.field_count(), 2);
+    let subs: Vec<Vec<u8>> = rec
+        .unit(1)
+        .unwrap()
+        .subs()
         .iter()
-        .map(|u| (u.value().unwrap().into_owned(), u.superseded()))
+        .map(|u| u.value().unwrap().into_owned())
         .collect();
+    assert_eq!(subs, [b"c".to_vec()]);
+    assert!(rec.unit(0).unwrap().subs().is_empty());
+    assert!(rec.unit(2).is_none());
+    // several, and nested: depth is the SUB run
+    let bb = parse("␞a␚␟b␚␚␟c␚␟d␟e");
+    let rec = Body::new(&bb).unwrap().record(0);
+    assert_eq!(rec.values().unwrap(), [b"a".as_ref(), b"e"]);
+    let a = rec.unit(0).unwrap();
+    assert_eq!(a.subs().len(), 2);
+    assert_eq!(a.subs()[0].value().unwrap().as_ref(), b"b");
+    assert_eq!(a.subs()[0].subs()[0].value().unwrap().as_ref(), b"c");
+    assert_eq!(a.subs()[1].value().unwrap().as_ref(), b"d");
+    assert!(a.subs()[1].subs().is_empty());
+    // the first unit exists even when empty; a sub-unit may be empty
+    let bb = parse("␞␚␟new␟x");
+    let rec = Body::new(&bb).unwrap().record(0);
+    assert_eq!(rec.values().unwrap(), [b"".as_ref(), b"x"]);
     assert_eq!(
-        units,
-        [
-            (b"a".to_vec(), true),
-            (b"b".to_vec(), false),
-            (b"c".to_vec(), false)
-        ]
+        rec.unit(0).unwrap().subs()[0].value().unwrap().as_ref(),
+        b"new"
     );
-    // every grain: keyed unit, group, file, heading key
-    let bb = parse("␞␁k␟v␚␁k␟w␁j␟1");
+    let bb = parse("␞old␚␟");
+    let rec = Body::new(&bb).unwrap().record(0);
+    assert_eq!(
+        rec.unit(0).unwrap().subs()[0].value().unwrap().as_ref(),
+        b""
+    );
+    // a keyed value takes sub-units too
+    let bb = parse("␞␁k␟v␚␟w␁j␟1");
     let rec = Body::new(&bb).unwrap().record(0);
     assert_eq!(rec.keys(), [b"k".as_ref(), b"j"]);
-    assert_eq!(rec.get("k").unwrap().unwrap().as_ref(), b"w");
-    let b3 = parse("␜f␝g␞x␝␝s␞1␚␝g␞y␚␜f␝h␞z");
+    assert_eq!(rec.get("k").unwrap().unwrap().as_ref(), b"v");
+    let k = rec.get_unit("k").unwrap();
+    assert_eq!(k.subs().len(), 1);
+    assert_eq!(k.subs()[0].value().unwrap().as_ref(), b"w");
+    assert!(rec.get_unit("j").unwrap().subs().is_empty());
+    // GS repetition is an empty-named group, not depth
+    let b3 = parse("␝␝b␞x");
     let doc = Document::new(&b3).unwrap();
-    assert_eq!(doc.files().len(), 1);
-    assert_eq!(doc.group_names(), [b"h".as_ref()]);
-    let b4 = parse("␖␁schema␟a␚␁schema␟b␞x");
-    let doc = Document::new(&b4).unwrap();
-    assert_eq!(doc.heading().schema(), Some(b"b".as_ref()));
-    assert!(doc.warnings().iter().all(|w| !w.contains("duplicate")));
-    // supersession is content: canonical, and kept by the builder
+    let groups: Vec<(&[u8], usize)> = doc.groups().map(|g| (g.name(), g.depth())).collect();
+    assert_eq!(groups, [(b"".as_ref(), 1), (b"b".as_ref(), 1)]);
+    // the prefix is structure: canonical, and written by the builder
     assert!(canonical(&parse("␞a␚␟b")));
+    assert!(canonical(&parse("␝␝b␞x")));
+    assert!(canonical(&parse("␝a␚␝b␞x")));
+    assert!(!canonical(b"\x1da\x1a \x1db\x1ex")); // layout after SUB
     let built = Builder::build(|b| {
-        b.begin_record().supersede("a", "b").field("c");
+        b.gs_name("a")
+            .gs_name_at("s", 2)
+            .rs_value("x")
+            .sub_unit("y")
+            .field("z");
     });
-    assert_eq!(built, parse("␞a␚␟b␟c"));
-    // nothing to supersede, or SUB before the wrong byte
+    assert_eq!(built, parse("␝a␚␝s␞x␚␟y␟z"));
+    let built = Builder::build(|b| {
+        b.begin_record().sub_unit("new").field("c");
+        b.record(&["a"]).sub_unit("b").sub_unit_at("c", 2);
+        b.section("deep", 3);
+    });
+    assert_eq!(built, parse("␞␚␟new␟c␞a␚␟b␚␚␟c␚␚␝deep"));
+    // reserved grains, skipped depths, SUB before the wrong byte
     for bad in [
         "␝g␚␞x",
+        "␜a␚␜b␞x",
+        "␞␁k␟v␚␁j␟w",
+        "␚␁␞a␞x",
+        "␖␁schema␟a␚␟b␞x",
         "␚␝g␞x",
-        "␚␜f␞x",
-        "␞␚␁k␟v",
+        "␝a␚␚␝c",
+        "␝a␚␝b␜f␚␝g",
+        "␞a␚␚␟c",
         "␞a␚b",
         "␞a␚",
         "␞a␟b␚␇␞c",
         "␞a␇␚␟b",
+        "␚␇␝b",
     ] {
         assert!(validate(&parse(bad)).is_err(), "{bad} must be rejected");
     }
+    // BEL kills a group line with its prefix; a subsection one deeper than
+    // a dead group is no skip as written, and dies with it
+    let b4 = parse("␝x␇␚␝draft␚␚␝notes␝y␞1");
+    let doc = Document::new(&b4).unwrap();
+    assert_eq!(doc.group_names(), [b"x".as_ref(), b"y"]);
+    let b5 = parse("␝a␇␚␝b␝c␞1");
+    let doc = Document::new(&b5).unwrap();
+    assert_eq!(doc.group_names(), [b"a".as_ref(), b"c"]);
 }
 
 #[test]
 fn dead_elements_take_their_contents() {
-    let b5 = parse("␝g1␞1␇␝g2␁␞x␞2␝␝s␞3␝g3␞4");
+    let b5 = parse("␝g1␞1␇␝g2␁␞x␞2␚␝s␞3␝g3␞4");
     let doc = Document::new(&b5).unwrap();
     assert_eq!(doc.group_names(), [b"g1".as_ref(), b"g3"]);
     let b6 = parse("␜a␝x␞1␇␜b␞2␜c␝y␞3");
@@ -430,12 +479,12 @@ fn pretty_roundtrip() {
 }
 
 #[test]
-fn pretty_keeps_supersession_with_its_element() {
-    // unit and keyed-unit grain inline; record, group, file and heading
-    // grain as a prefix on the element's line
+fn pretty_keeps_sub_with_its_element() {
+    // a sub-unit inline in its record; a depth prefix on the group's line;
+    // GS repetition is a group line of its own
     let cases = [
-        "␖␁schema␟a␚␁schema␟b\n␜f\n␝g\n  ␞a␟b␚␟c\n  ␞␁k␟v␚␁k␟w\n  ␚␞x\n␚␝g\n  ␞y\n␚␜f\n␝h\n  ␞z\n␄\n",
-        "␞a␟␐\n  ␞1␚␟2\n  ␚␞3\n␘\n",
+        "␖␁schema␟a\n␜f\n␝g\n  ␞a␟b␚␟c␚␚␟d\n  ␞␁k␟v␚␟w\n␚␝s\n  ␞y\n␚␚␝t\n␝\n␝h\n  ␞z\n␄\n",
+        "␞a␟␐\n  ␝s\n    ␞1␚␟2\n  ␚␝t\n    ␞3\n␘\n",
     ];
     for want in cases {
         let bytes = parse(want);
@@ -658,11 +707,17 @@ fn builder_spells_primitives_as_the_bytes_read() {
         ),
         (
             Builder::build(|b| {
-                b.gs().gs_name("sub").rs().enq("users").us().enq_level(|b| {
-                    b.gs_name("users").rs_value("1");
-                });
+                b.gs_name("top")
+                    .sub()
+                    .gs_name("sub")
+                    .rs()
+                    .enq("users")
+                    .us()
+                    .enq_level(|b| {
+                        b.gs_name("users").rs_value("1");
+                    });
             }),
-            "␝␝sub␞␅users␟␅␐␝users␞1␘",
+            "␝top␚␝sub␞␅users␟␅␐␝users␞1␘",
         ),
         (
             Builder::build(|b| {
@@ -675,7 +730,7 @@ fn builder_spells_primitives_as_the_bytes_read() {
                 b.fs("f")
                     .rs_value("old")
                     .sub()
-                    .rs_value("new")
+                    .us_value("new")
                     .gs_name("x")
                     .rs_value("10")
                     .sub()
@@ -684,9 +739,10 @@ fn builder_spells_primitives_as_the_bytes_read() {
                     .sub()
                     .us()
                     .sub()
+                    .sub()
                     .us_value(" c");
             }),
-            "␜f␞old␚␞new␝x␞10␚␟20␟a b␚␟␚␟␂ c␃",
+            "␜f␞old␚␟new␝x␞10␚␟20␟a b␚␟␚␚␟␂ c␃",
         ),
         (
             Builder::build(|b| {

@@ -147,11 +147,22 @@ pub fn comment(buf: &[u8], pos: usize, stop: usize) -> Result<usize> {
             keyed_unit_end(buf, pos + 1, stop)
         }
     } else if byte == GS {
+        // one group line: GS repetition is an empty group, not depth
+        Ok(plain(buf, pos + 1, stop))
+    } else if byte == SUB {
+        // a dead group line with its depth prefix: BEL SUB… GS name
         let mut p2 = pos;
-        while p2 < stop && (buf[p2] == GS || is_layout(buf[p2])) {
-            p2 += 1;
+        while p2 < stop && buf[p2] == SUB {
+            p2 = layout(buf, p2 + 1, stop);
         }
-        Ok(plain(buf, p2, stop))
+        if p2 < stop && buf[p2] == GS {
+            Ok(plain(buf, p2 + 1, stop))
+        } else {
+            Err(Error::syntax(
+                "BEL before a code that is not an element",
+                pos,
+            ))
+        }
     } else if byte == FS {
         Ok(plain(buf, pos + 1, stop))
     } else {
@@ -170,17 +181,14 @@ pub fn record_end(buf: &[u8], mut pos: usize, stop: usize) -> Result<usize> {
         if byte >= 0x20 || is_layout(byte) || byte == US || byte == ENQ {
             pos += 1;
         } else if byte == SUB {
-            // supersession of a unit or keyed unit stays inside the record;
-            // of a record, group or file, it ends this record first
-            let p2 = layout(buf, pos + 1, stop);
-            if !(p2 < stop && (buf[p2] == US || buf[p2] == SOH)) {
-                return Ok(pos);
+            // a sub-unit (a SUB run then US) stays inside the record; a SUB
+            // prefix before a line code ends this record first
+            let mut p2 = pos;
+            while p2 < stop && buf[p2] == SUB {
+                p2 = layout(buf, p2 + 1, stop);
             }
-            if buf[p2] == SOH {
-                let p3 = layout(buf, p2 + 1, stop);
-                if p3 < stop && buf[p3] == RS {
-                    return Ok(pos);
-                }
+            if !(p2 < stop && buf[p2] == US) {
+                return Ok(pos);
             }
             pos = p2;
         } else if byte == SOH {
@@ -196,9 +204,10 @@ pub fn record_end(buf: &[u8], mut pos: usize, stop: usize) -> Result<usize> {
             pos = level(buf, pos, stop)?;
         } else if byte == BEL {
             // a note inside the record, or a dead element; a dead
-            // record-level element (BEL RS / BEL GS …) ends this record first.
+            // record-level element (BEL RS / BEL GS / BEL SUB… GS …) ends
+            // this record first.
             let p2 = layout(buf, pos + 1, stop);
-            if p2 < stop && (buf[p2] == RS || buf[p2] == GS || buf[p2] == FS) {
+            if p2 < stop && matches!(buf[p2], RS | GS | FS | SUB) {
                 return Ok(pos);
             }
             if p2 < stop && buf[p2] == SOH {

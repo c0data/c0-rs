@@ -4,8 +4,8 @@ A Rust implementation of [C0DATA](https://github.com/c0data) — structured
 data built on ASCII C0 control codes. Values are UTF-8 text (any bytes, as
 text); structure is sixteen single-byte codes: FS/GS/RS/US separators, SOH
 keys and header rows, STX…ETX text, DLE…CAN nesting, ENQ references, BEL
-comments, SUB supersession, SYN/EOT document framing, ETB stream commits,
-EM trailing blobs.
+comments, SUB subordinates (subsections and sub-units), SYN/EOT document
+framing, ETB stream commits, EM trailing blobs.
 
 This crate is a **zero-copy** reader/writer: readers index a buffer once and
 hand back slices (`&[u8]`) into it, decoding text only on demand
@@ -111,13 +111,15 @@ written with `reference(name)`, `reference_to(group, record, field)` or
 
 The readers report the **result**. A dead element (`␇␞…`) is parsed and
 dropped with everything it holds: `␇␝g` takes the group's header row,
-records and subsections, `␇␜f` the file's groups. A superseded element is
-dropped in favour of the one that supersedes it: `␚` before a separator or
-opener means the element before is replaced by the element after, at that
-grain (`old␚␟new` a unit, `␚␁` a keyed unit, `␚␞` a record, `␚␝` a group,
-`␚␜` a file, in the heading too). `␞a␟b␚␟c` reads as `["a", "c"]`;
-`Record::units` lists the units as written, each with `superseded()`.
-Supersession is content: canonical form keeps it and hashes it as
+records and subsections, `␇␜f` the file's groups. `␚` (SUB) before a
+separator makes the element after it a **child** of the element before,
+at that code's grain: `␚␝s` is a subsection at depth two (`␚␚␝t` depth
+three; a depth is never skipped, and `␝␝b` is an empty-named group then
+`b`), and `␞a␟b␚␟c` is two units, `a` and `b`, with `c` a sub-unit of `b`
+that is not a unit of the record: `values()` reads `["a", "b"]`,
+`Record::unit(n)` and `Record::get_unit(key)` give a unit with its
+`subs()`, nested (`␞a␚␟b␚␚␟c`). `␚␞`, `␚␜` and `␚␁` are reserved and
+refused. The prefix is structure: canonical form keeps it and hashes it as
 written. Malformed input fails at construction (`Body::new`,
 `Document::new`, `Container::new` return `Err`); canonical checking is
 separate and never fails construction.
@@ -142,11 +144,11 @@ let buf = c0::Builder::build(|b| {
     b.gs_name("users").soh().rs_value("name").us_value("amount");      // ␝users␁␞name␟amount
     b.rs_value("cfg").us().dle().rs().soh_key("b").us_value("2").can(); // ␞cfg␟␐␞␁b␟2␘
     b.bel().gs_name("old");                                            // ␇␝old: a dead group
-    b.gs().gs_name("sub").rs().enq("users").us().enq_level(|b| {
-        b.gs_name("users").rs_value("1");                              // ␝␝sub␞␅users␟␅␐␝users␞1␘
+    b.sub().gs_name("sub").rs().enq("users").us().enq_level(|b| {
+        b.gs_name("users").rs_value("1");                              // ␚␝sub␞␅users␟␅␐␝users␞1␘
     });
-    b.rs_value("old").sub().us_value("new");                           // ␞old␚␟new (old superseded by new)
-    b.rs_value("a").sub().rs_value("b");                               // ␞a␚␞b (the record superseded)
+    b.rs_value("old").sub().us_value("new");                           // ␞old␚␟new (new is a sub-unit of old)
+    b.gs_name_at("intro", 2).rs_value("a").sub_unit("b");              // ␚␝intro␞a␚␟b
 });
 ```
 
@@ -207,7 +209,8 @@ it, which is what `r.damaged()` lists.
 ### C0DIFF
 
 A diff is a document of `shape` `diff` whose records are anchored patterns;
-`old␚␟new` inside one is the substitution (DIFF.md in the spec):
+`old␚␟new` inside one (the sub-unit of `old`) is the substitution (DIFF.md
+in the spec):
 
 ```
 ␖␁shape␟diff
@@ -233,7 +236,7 @@ Each record's search text must match once from the previous match to the
 end of the file. There is no replace-all mark: a tool expands one into
 anchored records against the target. Anything the text diff does not use
 (keyed units, levels, references, header rows, GS, dead records or file
-lines, supersession at another grain, a chained supersession) is refused
+lines, two sub-units on one unit, a sub-unit of a sub-unit) is refused
 with `DiffError::Refused`; a hunk is kept without applying by writing it
 in a note (`␇␂␞…␃`).
 

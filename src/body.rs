@@ -1,6 +1,6 @@
 //! Zero-copy navigator for a document body: files, groups, header rows and
 //! records, each a slice into the original buffer. The structure is built
-//! once by the [`Parser`] with dead and superseded elements dropped.
+//! once by the [`Parser`] with dead elements dropped.
 
 use crate::*;
 use std::borrow::Cow;
@@ -202,8 +202,8 @@ impl<'a> FileView<'a> {
     }
 }
 
-/// A group: its depth (GS count; 0 for the unnamed leading group), name,
-/// optional header row and records.
+/// A group: its depth (one plus its SUB prefix; 0 for the unnamed leading
+/// group), name, optional header row and records.
 pub struct Group<'a> {
     buf: &'a [u8],
     pub(crate) depth: usize,
@@ -233,7 +233,8 @@ impl<'a> Group<'a> {
         trim(&self.buf[self.name_start..self.name_end])
     }
 
-    /// GS repetitions: 1 for `␝g`, 2 for `␝␝g`; 0 for the unnamed group.
+    /// Depth: 1 for `␝g`, 2 for `␚␝g` (one plus the SUB prefix); 0 for the
+    /// unnamed group.
     pub fn depth(&self) -> usize {
         self.depth
     }
@@ -295,23 +296,25 @@ fn name_value(raw: &[u8]) -> &[u8] {
 /// A key and its logical value, from a keyed record.
 pub type Pair<'a> = (&'a [u8], Cow<'a, [u8]>);
 
-/// One unit of a positional record as written: its raw bytes and whether
-/// the unit after it supersedes it (`old␚␟new`).
-#[derive(Clone, Copy, PartialEq, Eq)]
+/// One unit as written: its raw value bytes and its sub-units (`␞a␟b␚␟c`:
+/// `b` holds the sub-unit `c`; DESIGN.md, Subordinates), each a `Unit`
+/// with sub-units of its own (`␞a␚␟b␚␚␟c`: `a` holds `b` holding `c`).
+#[derive(Clone, PartialEq, Eq)]
 pub struct Unit<'a> {
     raw: &'a [u8],
-    superseded: bool,
+    subs: Vec<Unit<'a>>,
 }
 
 impl<'a> Unit<'a> {
-    /// Raw bytes of the unit (layout at its edges included, the SUB not).
+    /// Raw bytes of the unit's value (layout at its edges included, its
+    /// sub-units not).
     pub fn raw(&self) -> &'a [u8] {
         self.raw
     }
 
-    /// Whether the unit after this one supersedes it.
-    pub fn superseded(&self) -> bool {
-        self.superseded
+    /// The sub-units, in written order; empty for a unit without any.
+    pub fn subs(&self) -> &[Unit<'a>] {
+        &self.subs
     }
 
     /// The logical value.
@@ -324,15 +327,18 @@ impl fmt::Debug for Unit<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Unit")
             .field("raw", &String::from_utf8_lossy(self.raw))
-            .field("superseded", &self.superseded)
+            .field("subs", &self.subs)
             .finish()
     }
 }
 
-/// A record: positional or keyed. Copyable, zero-copy accessors. The
-/// positional and keyed accessors report the record's **result**: a
-/// superseded unit is not among them; [`Record::units`] lists every unit
-/// as written.
+// (depth, value start, value end) of a sub-unit as written.
+type SubSpan = (usize, usize, usize);
+
+/// A record: positional or keyed. Copyable, zero-copy accessors. A
+/// sub-unit is not a unit of the record: `fields`, `values` and `pairs`
+/// list the units; [`Record::unit`] and [`Record::get_unit`] give a unit
+/// with its sub-units.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Record<'a> {
     buf: &'a [u8],
@@ -364,18 +370,18 @@ impl<'a> Record<'a> {
         self.start
     }
 
-    /// Whether the record is keyed (its first unit, live, dead or
-    /// superseding, is an SOH).
+    /// Whether the record is keyed (its first unit, live or dead, is an
+    /// SOH).
     pub fn keyed(&self) -> bool {
         let buf = self.buf;
         let end = self.end;
         let mut p = scan::layout(buf, self.start, end);
-        while p < end && (buf[p] == BEL || buf[p] == SUB) {
+        while p < end && buf[p] == BEL {
             let p2 = scan::layout(buf, p + 1, end);
             if p2 < end && buf[p2] == SOH {
                 return true;
             }
-            if p2 >= end || buf[p] == SUB || (buf[p2] < 0x20 && buf[p2] != STX) {
+            if p2 >= end || (buf[p2] < 0x20 && buf[p2] != STX) {
                 break;
             }
             match scan::comment(buf, p, end) {
@@ -388,20 +394,21 @@ impl<'a> Record<'a> {
 
     // ---- positional -----------------------------------------------------
 
-    /// Raw slice of unit `n` of the result (layout at its edges included);
-    /// empty when there is no such unit.
+    /// Raw slice of unit `n` (layout at its edges included, its sub-units
+    /// not); empty when there is no such unit.
     pub fn field(&self, n: usize) -> &'a [u8] {
         self.unit_ranges()
             .get(n)
             .map_or(&[][..], |&(s, e)| &self.buf[s..e])
     }
 
-    /// Number of positional units in the result (0 for a keyed record).
+    /// Number of positional units (0 for a keyed record). A sub-unit is
+    /// not counted.
     pub fn field_count(&self) -> usize {
         self.unit_ranges().len()
     }
 
-    /// Raw slices of every unit of the result.
+    /// Raw slices of every unit.
     pub fn fields(&self) -> Vec<&'a [u8]> {
         self.unit_ranges()
             .into_iter()
@@ -409,15 +416,27 @@ impl<'a> Record<'a> {
             .collect()
     }
 
-    /// Every unit as written, superseded ones included.
+    /// Every positional unit with its sub-units.
     pub fn units(&self) -> Vec<Unit<'a>> {
-        self.written_units()
+        self.unit_spans()
             .into_iter()
-            .map(|(s, e, superseded)| Unit {
+            .map(|(s, e, subs)| Unit {
                 raw: &self.buf[s..e],
-                superseded,
+                subs: sub_tree(self.buf, &subs),
             })
             .collect()
+    }
+
+    /// Positional unit `n` with its sub-units, or `None` when there is no
+    /// such unit.
+    pub fn unit(&self, n: usize) -> Option<Unit<'a>> {
+        self.unit_spans()
+            .into_iter()
+            .nth(n)
+            .map(|(s, e, subs)| Unit {
+                raw: &self.buf[s..e],
+                subs: sub_tree(self.buf, &subs),
+            })
     }
 
     /// Logical value of unit `n`: text decoded, layout trimmed.
@@ -465,29 +484,43 @@ impl<'a> Record<'a> {
 
     // ---- keyed ---------------------------------------------------------
 
-    /// Keys of the result in written order (duplicates included).
+    /// Keys in written order (duplicates included).
     pub fn keys(&self) -> Vec<&'a [u8]> {
         self.keyed_ranges()
             .unwrap_or_default()
             .into_iter()
-            .map(|(k, _, _)| k)
+            .map(|(k, _, _, _)| k)
             .collect()
     }
 
-    /// (key, logical value) pairs of the result in written order.
+    /// (key, logical value) pairs in written order.
     pub fn pairs(&self) -> Result<Vec<Pair<'a>>> {
         self.keyed_ranges()?
             .into_iter()
-            .map(|(k, vs, ve)| Ok((k, value(&self.buf[vs..ve])?)))
+            .map(|(k, vs, ve, _)| Ok((k, value(&self.buf[vs..ve])?)))
             .collect()
     }
 
     /// Raw unit for a key (last wins), or `None`.
     pub fn get_raw(&self, key: &str) -> Option<&'a [u8]> {
         let mut found = None;
-        for (k, vs, ve) in self.keyed_ranges().unwrap_or_default() {
+        for (k, vs, ve, _) in self.keyed_ranges().unwrap_or_default() {
             if k == key.as_bytes() {
                 found = Some(&self.buf[vs..ve]);
+            }
+        }
+        found
+    }
+
+    /// The unit under a key with its sub-units (last wins), or `None`.
+    pub fn get_unit(&self, key: &str) -> Option<Unit<'a>> {
+        let mut found = None;
+        for (k, vs, ve, subs) in self.keyed_ranges().unwrap_or_default() {
+            if k == key.as_bytes() {
+                found = Some(Unit {
+                    raw: &self.buf[vs..ve],
+                    subs: sub_tree(self.buf, &subs),
+                });
             }
         }
         found
@@ -509,10 +542,36 @@ impl<'a> Record<'a> {
 
     // ---- internals ------------------------------------------------------
 
-    // (start, end, superseded) of each positional unit as written. A record
-    // comes from a parsed body, whose text and levels were already checked,
-    // so the unit scan cannot fail; should it, the unit runs to the end.
-    fn written_units(&self) -> Vec<(usize, usize, bool)> {
+    // Skip the sub-units after a value ending at `pos`, collecting their
+    // (depth, start, end) spans. Returns the position after them: the US
+    // of the next unit, a SUB prefixing the next line, or the end.
+    fn sub_spans(&self, mut pos: usize, spans: &mut Vec<SubSpan>) -> usize {
+        let buf = self.buf;
+        let end = self.end;
+        loop {
+            if !(pos < end && buf[pos] == SUB) {
+                return pos;
+            }
+            let mut q = pos;
+            let mut run = 0usize;
+            while q < end && buf[q] == SUB {
+                run += 1;
+                q = scan::layout(buf, q + 1, end);
+            }
+            if !(q < end && buf[q] == US) {
+                return pos;
+            }
+            let ss = q + 1;
+            let se = scan::unit(buf, ss, end).unwrap_or(end);
+            spans.push((run, ss, se));
+            pos = se;
+        }
+    }
+
+    // (start, end, sub-unit spans) of each positional unit. A record comes
+    // from a parsed body, whose text and levels were already checked, so
+    // the unit scan cannot fail; should it, the unit runs to the end.
+    fn unit_spans(&self) -> Vec<(usize, usize, Vec<SubSpan>)> {
         let buf = self.buf;
         let end = self.end;
         let mut out = Vec::new();
@@ -523,16 +582,9 @@ impl<'a> Record<'a> {
         let mut unit_start = self.start;
         loop {
             pos = scan::unit(buf, pos, end).unwrap_or(end);
-            let mut superseded = false;
-            let mut next = pos;
-            if pos < end && buf[pos] == SUB {
-                let p2 = scan::layout(buf, pos + 1, end);
-                if p2 < end && buf[p2] == US {
-                    superseded = true;
-                    next = p2;
-                }
-            }
-            out.push((unit_start, pos, superseded));
+            let mut spans = Vec::new();
+            let next = self.sub_spans(pos, &mut spans);
+            out.push((unit_start, pos, spans));
             if !(next < end && buf[next] == US) {
                 break;
             }
@@ -542,17 +594,17 @@ impl<'a> Record<'a> {
         out
     }
 
-    // (start, end) of each positional unit of the result.
+    // (start, end) of each positional unit.
     fn unit_ranges(&self) -> Vec<(usize, usize)> {
-        self.written_units()
+        self.unit_spans()
             .into_iter()
-            .filter(|&(_, _, sup)| !sup)
             .map(|(s, e, _)| (s, e))
             .collect()
     }
 
-    // (key, value start, value end) per keyed unit of the result.
-    fn keyed_ranges(&self) -> Result<Vec<(&'a [u8], usize, usize)>> {
+    // (key, value start, value end, sub-unit spans) per keyed unit.
+    #[allow(clippy::type_complexity)]
+    fn keyed_ranges(&self) -> Result<Vec<(&'a [u8], usize, usize, Vec<SubSpan>)>> {
         let buf = self.buf;
         let end = self.end;
         let mut out = Vec::new();
@@ -567,21 +619,12 @@ impl<'a> Record<'a> {
                 }
                 let vs = ke + 1;
                 let ve = scan::unit(buf, vs, end)?;
-                let mut superseded = false;
-                pos = ve;
-                if ve < end && buf[ve] == SUB {
-                    let p2 = scan::layout(buf, ve + 1, end);
-                    if p2 < end && buf[p2] == SOH {
-                        superseded = true;
-                        pos = p2;
-                    }
-                }
-                if !superseded {
-                    out.push((trim(&buf[ks..ke]), vs, ve));
-                }
+                let mut spans = Vec::new();
+                pos = self.sub_spans(ve, &mut spans);
+                out.push((trim(&buf[ks..ke]), vs, ve, spans));
             } else if b == BEL {
                 pos = scan::comment(buf, pos, end)?;
-            } else if b == SUB || is_layout(b) {
+            } else if is_layout(b) {
                 pos += 1;
             } else {
                 break;
@@ -589,6 +632,27 @@ impl<'a> Record<'a> {
         }
         Ok(out)
     }
+}
+
+// Build the sub-unit tree from (depth, start, end) spans in written order:
+// the spans after one that are deeper than it are its descendants. The
+// parser has refused skipped depths.
+fn sub_tree<'a>(buf: &'a [u8], spans: &[SubSpan]) -> Vec<Unit<'a>> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < spans.len() {
+        let (d, s, e) = spans[i];
+        let mut j = i + 1;
+        while j < spans.len() && spans[j].0 > d {
+            j += 1;
+        }
+        out.push(Unit {
+            raw: &buf[s..e],
+            subs: sub_tree(buf, &spans[i + 1..j]),
+        });
+        i = j;
+    }
+    out
 }
 
 /// A reference (DESIGN.md, References): a group name written plain, or a

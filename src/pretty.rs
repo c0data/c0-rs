@@ -101,31 +101,30 @@ fn format_compact(buf: &[u8], indent: &str, out: &mut Vec<u8>) -> Result<()> {
                 gdepth = 1;
             }
             GS => {
-                let mut run = 0;
-                while pos < len && buf[pos] == GS {
-                    run += 1;
-                    pos += 1;
-                }
+                // one group line per GS: repetition is an empty group
                 if !prefixed {
                     newline_unless(out, line_start);
                     write_indent(out, indent, depth);
                 }
                 prefixed = false;
-                for _ in 0..run {
-                    push_glyph(out, GS);
-                }
-                pos = write_plain(buf, pos, len, out)?;
+                push_glyph(out, GS);
+                pos = write_plain(buf, pos + 1, len, out)?;
                 out.push(b'\n');
                 line_start = true;
                 gdepth = 1;
             }
             SUB => {
-                // the mark stands on the line of the element it qualifies
-                let p2 = scan::layout(buf, pos + 1, len);
+                // a depth prefix stands on the line of the group it qualifies
+                let mut p2 = scan::layout(buf, pos + 1, len);
+                while p2 < len && buf[p2] == SUB {
+                    p2 = scan::layout(buf, p2 + 1, len);
+                }
                 if p2 < len && (buf[p2] == GS || buf[p2] == FS) {
                     newline_unless(out, line_start);
                     write_indent(out, indent, depth);
-                    push_glyph(out, SUB);
+                    for _ in 0..count_sub(&buf[pos..p2]) {
+                        push_glyph(out, SUB);
+                    }
                     prefixed = true;
                     line_start = false;
                     pos = p2;
@@ -232,8 +231,7 @@ fn write_element(
             return write_element(buf, pos, len, out, depth, gdepth, stack);
         }
         SUB => {
-            // supersession of a record, keyed unit, group or file: the mark
-            // stands with the element it qualifies
+            // a SUB before a line code stands with the element it prefixes
             push_glyph(out, SUB);
             pos = scan::layout(buf, pos + 1, len);
             if pos >= len {
@@ -298,20 +296,18 @@ fn write_units(
             push_glyph(out, b);
             pos += 1;
         } else if b == SUB {
-            // before US or a keyed unit the supersession is inside this
-            // record, on this line; before anything else the mark belongs to
-            // the next element
-            let p2 = scan::layout(buf, pos + 1, len);
-            if !(p2 < len && (buf[p2] == US || buf[p2] == SOH)) {
+            // a sub-unit (a SUB run then US) is inside this record, on this
+            // line; a SUB run before a line code prefixes the next element
+            let mut p2 = scan::layout(buf, pos + 1, len);
+            while p2 < len && buf[p2] == SUB {
+                p2 = scan::layout(buf, p2 + 1, len);
+            }
+            if !(p2 < len && buf[p2] == US) {
                 break;
             }
-            if buf[p2] == SOH {
-                let p3 = scan::layout(buf, p2 + 1, len);
-                if p3 < len && buf[p3] == RS {
-                    break;
-                }
+            for _ in 0..count_sub(&buf[pos..p2]) {
+                push_glyph(out, SUB);
             }
-            push_glyph(out, SUB);
             pos = p2;
         } else if b == SOH {
             let p2 = scan::layout(buf, pos + 1, len);
@@ -391,18 +387,6 @@ fn write_heading(buf: &[u8], mut pos: usize, len: usize, out: &mut Vec<u8>) -> R
             } else {
                 break;
             }
-        } else if b == SUB {
-            // a superseded heading key stays on the heading line
-            let p2 = scan::layout(buf, pos + 1, len);
-            if !(p2 < len && buf[p2] == SOH) {
-                break;
-            }
-            let p3 = scan::layout(buf, p2 + 1, len);
-            if p3 < len && buf[p3] == RS {
-                break;
-            }
-            push_glyph(out, SUB);
-            pos = p2;
         } else if is_layout(b) {
             pos += 1;
         } else {
@@ -410,6 +394,11 @@ fn write_heading(buf: &[u8], mut pos: usize, len: usize, out: &mut Vec<u8>) -> R
         }
     }
     Ok(pos)
+}
+
+// The SUB bytes in a run (layout between them allowed).
+fn count_sub(run: &[u8]) -> usize {
+    run.iter().filter(|&&b| b == SUB).count()
 }
 
 // A level written on one line (used for heading values).

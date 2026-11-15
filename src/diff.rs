@@ -1,7 +1,7 @@
 //! C0DIFF: atomic multi-file edits with anchored patterns (DIFF.md). A
 //! diff is an ordinary document of `shape` `diff`: files of records, each
-//! record a pattern of units, with `old␚␟new` (supersession at the unit
-//! grain) as the substitution.
+//! record a pattern of units, with `old␚␟new` (the sub-unit of `old`) as
+//! the substitution.
 //!
 //! ```
 //! use std::collections::HashMap;
@@ -116,7 +116,7 @@ pub struct Pattern {
 }
 
 impl Pattern {
-    /// What the file must hold, once: anchors and superseded units.
+    /// What the file must hold, once: anchors and olds.
     pub fn search(&self) -> Vec<u8> {
         self.units
             .iter()
@@ -124,7 +124,7 @@ impl Pattern {
             .collect()
     }
 
-    /// What it will hold: superseding units in place of superseded ones.
+    /// What it will hold: each sub-unit in place of the unit that holds it.
     pub fn replacement(&self) -> Vec<u8> {
         self.units
             .iter()
@@ -164,9 +164,6 @@ pub fn parse(buf: &[u8]) -> DiffResult<Vec<FileEdit>> {
             "a dead element in a diff: a hunk is kept without applying by writing it in a note",
         ));
     }
-    if parser.supersessions().iter().any(|&c| c != US) {
-        return Err(refused("supersession at a grain other than the unit"));
-    }
     let mut files: Vec<FileEdit> = Vec::new();
     for f in doc.body().files() {
         if f.is_leading() {
@@ -204,33 +201,38 @@ fn pattern_of(rec: &Record<'_>) -> DiffResult<Pattern> {
         return Err(refused("a keyed unit in a diff record"));
     }
     let mut units = Vec::new();
-    let mut pending: Option<Vec<u8>> = None;
     for u in rec.units() {
-        let raw = u.raw();
-        if is_level(raw) {
-            return Err(refused("a nested level in a diff record"));
-        }
-        if is_reference(raw) {
-            return Err(refused("a reference in a diff record"));
-        }
-        let v = value(raw)?.into_owned();
-        if u.superseded() {
-            if pending.is_some() {
-                return Err(refused(
-                    "a chained supersession: its search text would hold what the file never held",
-                ));
+        let old = diff_value(u.raw())?;
+        match u.subs() {
+            [] => units.push(Unit { old, new: None }),
+            [sub] => {
+                if !sub.subs().is_empty() {
+                    return Err(refused("a sub-unit of a sub-unit in a diff record"));
+                }
+                let new = diff_value(sub.raw())?;
+                if old.is_empty() && new.is_empty() {
+                    return Err(refused("a substitution of nothing by nothing"));
+                }
+                units.push(Unit {
+                    old,
+                    new: Some(new),
+                });
             }
-            pending = Some(v);
-        } else if let Some(old) = pending.take() {
-            if old.is_empty() && v.is_empty() {
-                return Err(refused("a substitution of nothing by nothing"));
-            }
-            units.push(Unit { old, new: Some(v) });
-        } else {
-            units.push(Unit { old: v, new: None });
+            _ => return Err(refused("two sub-units on one unit: one old has one new")),
         }
     }
     Ok(Pattern { units })
+}
+
+// The value of a diff unit: plain or text, never a level or a reference.
+fn diff_value(raw: &[u8]) -> DiffResult<Vec<u8>> {
+    if is_level(raw) {
+        return Err(refused("a nested level in a diff record"));
+    }
+    if is_reference(raw) {
+        return Err(refused("a reference in a diff record"));
+    }
+    Ok(value(raw)?.into_owned())
 }
 
 /// Apply a diff to in-memory text files. Validates everything first and

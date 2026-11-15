@@ -50,14 +50,12 @@ fn strs(v: &Value) -> Vec<&str> {
         .collect()
 }
 
-// Flatten a group list with "sections" into (depth, group) pairs. A
-// section with a null name is a skipped depth: no group stands there.
+// Flatten a group list with "sections" (SUB GS subsections) into (depth,
+// group) pairs.
 fn flat_groups(groups: &[Value], depth: usize) -> Vec<(usize, &Value)> {
     let mut out = Vec::new();
     for g in groups {
-        if g["name"].is_string() {
-            out.push((depth, g));
-        }
+        out.push((depth, g));
         if let Some(secs) = g.get("sections").and_then(Value::as_array) {
             out.extend(flat_groups(secs, depth + 1));
         }
@@ -67,6 +65,37 @@ fn flat_groups(groups: &[Value], depth: usize) -> Vec<(usize, &Value)> {
 
 // ---------------------------------------------------------------- checking
 
+// A unit's value part alone: a scalar or a level.
+fn check_unit_value(u: &Unit, f: &Value, case: &str) {
+    if is_scalar(f) {
+        assert_eq!(
+            u.value().unwrap().as_ref(),
+            scalar_bytes(f).as_slice(),
+            "{case}: unit value"
+        );
+    } else if let Some(lvl) = f.get("level") {
+        check_body(&Body::of_level(u.raw()).unwrap(), lvl, case);
+    } else {
+        panic!("{case}: unknown unit value form {f}");
+    }
+}
+
+// A unit with sub-units: {"value": v, "subs": [...]}, nested; a scalar or
+// a level is a unit without any.
+fn check_unit(u: &Unit, f: &Value, case: &str) {
+    if let Some(subs) = f.get("subs") {
+        let subs = subs.as_array().unwrap();
+        check_unit_value(u, &f["value"], case);
+        assert_eq!(u.subs().len(), subs.len(), "{case}: sub-unit count");
+        for (k, sf) in subs.iter().enumerate() {
+            check_unit(&u.subs()[k], sf, case);
+        }
+    } else {
+        check_unit_value(u, f, case);
+        assert!(u.subs().is_empty(), "{case}: no sub-units expected");
+    }
+}
+
 fn check_value(rec: &Record, i: usize, f: &Value, case: &str) {
     if is_scalar(f) {
         assert_eq!(
@@ -74,6 +103,12 @@ fn check_value(rec: &Record, i: usize, f: &Value, case: &str) {
             scalar_bytes(f).as_slice(),
             "{case}: field {i}"
         );
+        assert!(
+            rec.unit(i).unwrap().subs().is_empty(),
+            "{case}: field {i} has no sub-units"
+        );
+    } else if f.get("subs").is_some() {
+        check_unit(&rec.unit(i).unwrap(), f, case);
     } else if let Some(lvl) = f.get("level") {
         check_body(&rec.level(i).unwrap(), lvl, case);
     } else if let Some(r) = f.get("ref") {
@@ -110,11 +145,16 @@ fn check_record(rec: &Record, r: &Value, case: &str) {
         assert_eq!(rec.keys(), keys, "{case}: keys");
         let got = rec.pairs().unwrap();
         for (j, p) in pairs.iter().enumerate() {
-            assert_eq!(
-                got[j].1.as_ref(),
-                scalar_bytes(&p[1]).as_slice(),
-                "{case}: key {j} value"
-            );
+            if is_scalar(&p[1]) {
+                assert_eq!(
+                    got[j].1.as_ref(),
+                    scalar_bytes(&p[1]).as_slice(),
+                    "{case}: key {j} value"
+                );
+            } else {
+                let key = p[0].as_str().unwrap();
+                check_unit(&rec.get_unit(key).unwrap(), &p[1], case);
+            }
         }
     }
 }
@@ -253,11 +293,12 @@ fn build_record(b: &mut Builder, r: &Value) {
 fn build_groups(b: &mut Builder, groups: &[Value], depth: usize) {
     for (i, g) in groups.iter().enumerate() {
         let headers: Option<Vec<&str>> = g["headers"].as_array().map(|_| strs(&g["headers"]));
-        if g["name"].as_str() == Some("") && i == 0 && depth == 1 {
+        let name = g["name"].as_str().unwrap();
+        if name.is_empty() && i == 0 && depth == 1 {
             if let Some(h) = &headers {
                 b.header(h); // the unnamed leading group: no GS
             }
-        } else if let Some(name) = g["name"].as_str() {
+        } else {
             b.group_at(name, headers.as_deref(), depth);
         }
         for r in g["records"].as_array().unwrap() {
@@ -552,18 +593,18 @@ fn stream() {
 #[test]
 fn every_vector_file_is_run() {
     let counts = [
-        ("decode.json", 97),
+        ("decode.json", 103),
         ("encode.json", 19),
-        ("canonical.json", 28),
-        ("invalid.json", 60),
+        ("canonical.json", 30),
+        ("invalid.json", 65),
         ("stream.json", 20),
         ("nested.json", 12),
-        ("diff.json", 41),
+        ("diff.json", 42),
     ];
     let mut total = 0;
     for (file, n) in counts {
         assert_eq!(cases(file).len(), n, "{file}: case count");
         total += n;
     }
-    assert_eq!(total, 277);
+    assert_eq!(total, 291);
 }

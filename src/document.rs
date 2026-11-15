@@ -5,7 +5,7 @@ use crate::*;
 use std::borrow::Cow;
 
 /// The heading of a document: keyed units after SYN, in written order,
-/// superseded keys dropped. A duplicate key is reported as written;
+/// dead keys dropped. A duplicate key is reported as written;
 /// lookups take the last value.
 pub struct Heading<'a> {
     raw: &'a [u8],
