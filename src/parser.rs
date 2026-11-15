@@ -649,7 +649,7 @@ impl<'a> Parser<'a> {
                     }
                     self.not_canonical("dead element");
                     let (_key, _vs, p) = self.keyed_unit(p2 + 1, stop, false)?;
-                    pos = p;
+                    pos = self.sub_units(p, stop)?; // a dead keyed unit takes its sub-units
                 } else if c >= 0x20 || c == STX {
                     pos = self.trailing_notes(pos, stop)?;
                 } else if c == SUB {
@@ -978,6 +978,10 @@ impl<'a> Parser<'a> {
             }
             return Ok(());
         };
+        // `fields` and `pairs` hide sub-units, so look for them explicitly
+        if rec.has_sub_units() {
+            return Err(Error::syntax("a sub-unit is not a step of a pattern", at));
+        }
         if rec.keyed() {
             let pairs = rec.pairs()?;
             if pairs.len() != 1 {

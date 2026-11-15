@@ -623,7 +623,10 @@ impl<'a> Record<'a> {
                 pos = self.sub_spans(ve, &mut spans);
                 out.push((trim(&buf[ks..ke]), vs, ve, spans));
             } else if b == BEL {
+                // a note, or a dead keyed unit, which takes its sub-units
                 pos = scan::comment(buf, pos, end)?;
+                let mut dead = Vec::new();
+                pos = self.sub_spans(pos, &mut dead);
             } else if is_layout(b) {
                 pos += 1;
             } else {
@@ -631,6 +634,18 @@ impl<'a> Record<'a> {
             }
         }
         Ok(out)
+    }
+
+    // Whether any unit, positional or keyed, holds a sub-unit.
+    pub(crate) fn has_sub_units(&self) -> bool {
+        self.unit_spans()
+            .iter()
+            .any(|(_, _, subs)| !subs.is_empty())
+            || self
+                .keyed_ranges()
+                .unwrap_or_default()
+                .iter()
+                .any(|(_, _, _, subs)| !subs.is_empty())
     }
 }
 

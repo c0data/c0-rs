@@ -593,10 +593,10 @@ fn stream() {
 #[test]
 fn every_vector_file_is_run() {
     let counts = [
-        ("decode.json", 103),
+        ("decode.json", 105),
         ("encode.json", 19),
         ("canonical.json", 30),
-        ("invalid.json", 65),
+        ("invalid.json", 67),
         ("stream.json", 20),
         ("nested.json", 12),
         ("diff.json", 42),
@@ -606,5 +606,5 @@ fn every_vector_file_is_run() {
         assert_eq!(cases(file).len(), n, "{file}: case count");
         total += n;
     }
-    assert_eq!(total, 291);
+    assert_eq!(total, 295);
 }
