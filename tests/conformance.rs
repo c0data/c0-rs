@@ -597,7 +597,7 @@ fn every_vector_file_is_run() {
         ("encode.json", 19),
         ("canonical.json", 30),
         ("invalid.json", 67),
-        ("stream.json", 20),
+        ("stream.json", 22),
         ("nested.json", 12),
         ("diff.json", 42),
     ];
@@ -606,5 +606,5 @@ fn every_vector_file_is_run() {
         assert_eq!(cases(file).len(), n, "{file}: case count");
         total += n;
     }
-    assert_eq!(total, 295);
+    assert_eq!(total, 297);
 }

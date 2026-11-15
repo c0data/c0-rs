@@ -204,7 +204,10 @@ or holding any other error, is **damaged** and delivers nothing. By default
 the reader yields the records before it (`each_record`) and then fails with
 `Error::DamagedBlock { index, resume_offset }`, the offset after the
 block's ETB and payload; `StreamReader::continuing(&bytes)` reads on past
-it, which is what `r.damaged()` lists.
+it, which is what `r.damaged()` lists. A SYN inside the stream tears the
+uncommitted bytes before it: they are no block and deliver nothing
+(`r.torn_regions()` gives their `[start, end)` ranges), and the new
+document's blocks are read as usual.
 
 ### C0DIFF
 

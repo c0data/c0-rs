@@ -7,6 +7,9 @@
 //! [`Error::DamagedBlock`] naming the offset to resume at; a reader made
 //! with [`StreamReader::continuing`] reads on past the block. The tail
 //! after the last commit is torn unless it holds only layout, notes or EOT.
+//! A SYN inside the stream tears the uncommitted bytes before it: they are
+//! no block and deliver nothing ([`StreamReader::torn_regions`]); the new
+//! document's blocks are read as usual.
 //!
 //! ```no_run
 //! let mut log = c0::open_log("events.c0")?;        // repairs a torn tail first
@@ -33,6 +36,9 @@ pub struct StreamReader<'a> {
     committed_end: usize,
     blocks: Vec<(usize, usize)>,
     damaged: Vec<usize>,
+    // Uncommitted bytes torn by a mid-stream SYN, [start, end): skipped
+    // like damaged blocks. Layout alone before a SYN is not a tear.
+    torn_regions: Vec<(usize, usize)>,
     torn: bool,
     continue_past_damage: bool,
     // The committed region parsed with damaged blocks skipped; an error
@@ -57,6 +63,7 @@ impl<'a> StreamReader<'a> {
             committed_end: 0,
             blocks: Vec::new(),
             damaged: Vec::new(),
+            torn_regions: Vec::new(),
             torn: false,
             continue_past_damage,
             container: Err(Error::other("unparsed")),
@@ -89,6 +96,15 @@ impl<'a> StreamReader<'a> {
     /// not count).
     pub fn torn(&self) -> bool {
         self.torn
+    }
+
+    /// `[start, end)` of every region torn by a SYN inside the stream: the
+    /// uncommitted bytes between a commit (or the start) and the SYN that
+    /// began the next document. They belong to no block and deliver
+    /// nothing. Layout alone before a SYN is not a tear. The torn tail
+    /// after the last commit is [`StreamReader::torn`], not listed here.
+    pub fn torn_regions(&self) -> &[(usize, usize)] {
+        &self.torn_regions
     }
 
     /// Whether the reader goes on past a damaged block.
@@ -215,11 +231,12 @@ impl<'a> StreamReader<'a> {
         }
     }
 
-    // Parse the committed region. Any error inside a committed block marks
-    // that block damaged; the region is then parsed again with the block
-    // skipped, so what follows is read in the context before it.
+    // Parse the committed region, torn regions skipped. Any error inside a
+    // committed block marks that block damaged; the region is then parsed
+    // again with the block skipped, so what follows is read in the context
+    // before it.
     fn parse_committed(&mut self) -> Result<Container<'a>> {
-        let mut skip: HashMap<usize, usize> = HashMap::new();
+        let mut skip: HashMap<usize, usize> = self.torn_regions.iter().copied().collect();
         let container = loop {
             let mut parser = Parser::with_skip(self.buf, skip.clone());
             match Container::parse(self.buf, self.committed_end, &mut parser) {
@@ -272,6 +289,7 @@ impl<'a> StreamReader<'a> {
                     // framing cuts the text
                     in_text = false;
                     if b == SYN {
+                        self.tear(block_start, pos);
                         block_start = pos;
                     }
                 }
@@ -286,12 +304,21 @@ impl<'a> StreamReader<'a> {
                     continue;
                 } else if b == SYN && pos > 0 {
                     // tears the uncommitted bytes before it; a new document begins
+                    self.tear(block_start, pos);
                     block_start = pos;
                 }
                 pos += 1;
             }
         }
         self.torn = self.torn_tail();
+    }
+
+    // A SYN at `end` tears the uncommitted bytes from `start`: a torn
+    // region unless it holds layout alone.
+    fn tear(&mut self, start: usize, end: usize) {
+        if scan::layout(self.buf, start, end) < end {
+            self.torn_regions.push((start, end));
+        }
     }
 
     // After an ETB: skip its payload and return committed_end (which

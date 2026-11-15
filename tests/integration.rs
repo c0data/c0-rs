@@ -551,6 +551,38 @@ fn stream_reader_torn_tail_and_damage() {
 }
 
 #[test]
+fn stream_reader_mid_stream_syn_tears() {
+    // A SYN inside the stream tears the uncommitted bytes before it: no
+    // block, no record; the new document's blocks are read as usual.
+    let bytes = parse("␞a␖␁shape␟stream␗␞b␗");
+    let r = StreamReader::new(&bytes);
+    assert_eq!(r.committed_end(), 20);
+    assert!(!r.torn());
+    assert_eq!(r.torn_regions(), &[(0, 2)]);
+    assert_eq!(r.block_count(), 2);
+    assert_eq!(r.block(0), parse("␖␁shape␟stream").as_slice());
+    assert_eq!(r.block(1), b"\x1eb");
+    assert_eq!(r.damaged(), &[] as &[usize]);
+    assert_eq!(r.records().unwrap(), vec![vec![b"b".to_vec()]]);
+    assert_eq!(r.document().unwrap().shape(), Some("stream"));
+    // Torn after a commit, inside open text: the region runs from the
+    // previous block's end to the SYN.
+    let bytes = parse("␞a␗␞␂cut␖␁k␟v␗␞c␗");
+    let r = StreamReader::new(&bytes);
+    assert_eq!(r.torn_regions(), &[(3, 8)]);
+    assert_eq!(r.block_count(), 3);
+    assert_eq!(
+        r.records().unwrap(),
+        vec![vec![b"a".to_vec()], vec![b"c".to_vec()]]
+    );
+    // Layout alone before a SYN is not a tear.
+    let bytes = parse("␞a␗\n␖␁k␟v␗");
+    let r = StreamReader::new(&bytes);
+    assert_eq!(r.torn_regions(), &[] as &[(usize, usize)]);
+    assert_eq!(r.block_count(), 2);
+}
+
+#[test]
 fn stream_writer_append_and_read() {
     let path = temp_path("append");
     {
